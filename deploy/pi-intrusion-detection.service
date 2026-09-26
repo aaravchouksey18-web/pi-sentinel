@@ -5,16 +5,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# CHANGE: the user that owns the project checkout (your Pi login)
 User=pi
-WorkingDirectory=/home/pi/projects/pi-intrusion-detection
-# Replace <CAMERA_URL> with your stream (e.g. http://192.0.2.50:81/stream)
-# or a device index (e.g. /dev/video0).
-ExecStart=/usr/bin/python3 /home/pi/projects/pi-intrusion-detection/intrusion.py \
+# %h expands to that user's home directory
+WorkingDirectory=%h/projects/pi-intrusion-detection
+# Replace <CAMERA_URL> with your stream — e.g. http://<camera-ip>:81/stream
+# (example: http://192.0.2.50:81/stream) or a device index (/dev/video0).
+ExecStart=/usr/bin/python3 %h/projects/pi-intrusion-detection/intrusion.py \
     --stream <CAMERA_URL> \
     --headless \
     --mqtt-broker 127.0.0.1 \
     --mqtt-topic intrusion/events \
-    --snapshot-dir /home/pi/snapshots
+    --snapshot-dir %h/snapshots
 # Telegram tokens etc. live here, outside the repo (see pi-intrusion.env.example)
 EnvironmentFile=/etc/pi-intrusion.env
 Restart=on-failure

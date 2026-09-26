@@ -8,24 +8,32 @@ a small JSON API that the single-page UI polls every couple of seconds.
     python3 dashboard.py --log events.jsonl --snapshot-dir snapshots \
         --port 8001
 
-Open http://<pi-ip>:8001 in a browser. Read-only by design — no secrets,
-no POST endpoints; safe to expose on your LAN.
+Open http://<pi-ip>:8001 in a browser. Read-only by design — no POST
+endpoints and no secrets — but it DOES serve camera imagery, so a token
+(--token) is recommended whenever the dashboard is reachable beyond your
+own machines. Run it behind a reverse proxy if you want TLS.
 
-Status is derived from the log:
-    ARMED  - no unresolved START
-    ACTIVE - the last event is a START with no END yet
-    STALE  - ACTIVE but that START is older than --active-timeout
-             (the detector may have died or the camera dropped)
+Status is derived from the log plus the sentry's state.json:
+    ARMED      - no unresolved START
+    ACTIVE     - the last event is a START with no END yet
+    STALE      - ACTIVE but that START is older than --active-timeout
+    DISARMED   - the sentry says it is disarmed (state.json)
+    OFFLINE    - state.json is older than --heartbeat-timeout
+    STREAM-ERR - the sentry reports the camera is not producing frames
 """
 
 import argparse
 import glob
+import hmac
 import html
 import json
 import os
+import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+
+_TOKEN_JS = "__DASH_TOKEN__"
 
 PAGE = """<!doctype html>
 <html lang="en">
@@ -50,6 +58,8 @@ PAGE = """<!doctype html>
             animation:pulse 1.1s ease-in-out infinite; }
   .STALE  { background:#2b2306; color:var(--warn); border:1px solid var(--warn); }
   .DISARMED { background:#1c2026; color:#9aa7b4; border:1px dashed #55606b; }
+  .OFFLINE { background:#1f1412; color:#ff9b72; border:1px solid #ff9b72; }
+  .STREAM-ERR { background:#2b2306; color:var(--warn); border:1px solid var(--warn); }
   @keyframes pulse { 50% { opacity:.45; } }
   main { display:grid; grid-template-columns: minmax(280px, 340px) 1fr;
          gap:16px; padding:16px 20px; }
@@ -116,12 +126,15 @@ PAGE = """<!doctype html>
 </main>
 <footer id="src" class="muted"></footer>
 <script>
-const esc = s => { const d = document.createElement("div"); d.textContent = s;
-                   return d.innerHTML; };
+const TOKEN = __TOKEN_JS__;
+const q = () => TOKEN ? "?t=" + encodeURIComponent(TOKEN) : "";
+const esc = s => { const d = document.createElement("div");
+  d.textContent = s == null ? "" : String(s);
+  return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;"); };
 const fmt = ts => ts ? new Date(ts * 1000).toLocaleString() : "—";
 async function tick() {
   try {
-    const r = await fetch("/api/events");
+    const r = await fetch("/api/events" + q());
     const d = await r.json();
     const pill = document.getElementById("pill");
     pill.textContent = d.status; pill.className = "pill " + d.status;
@@ -144,7 +157,7 @@ async function tick() {
       const e = d.last;
       lsev.innerHTML = (e.type === "start" ? "🚨 " : "✅ ") +
         esc(e.type.toUpperCase() + " at " + fmt(e.ts)) +
-        (e.duration ? ` — lasted ${e.duration}s` : "") +
+        (e.duration != null ? ` — lasted ${esc(e.duration)}s` : "") +
         (e.detections && e.detections.length
           ? `<div class="det">` + e.detections.map(x =>
               esc(`class ${x.class_id} · ${x.score}`)).join("<br>") + "</div>" : "");
@@ -152,8 +165,8 @@ async function tick() {
     const shots = document.getElementById("shots");
     shots.className = "shots";
     shots.innerHTML = d.snapshots.slice(0, 12).map(s =>
-      `<a href="/snapshots/${encodeURIComponent(s.name)}" target="_blank">` +
-      `<img src="/snapshots/${encodeURIComponent(s.name)}" alt="${esc(s.name)}">` +
+      `<a href="/snapshots/${encodeURIComponent(s.name)}${q()}" target="_blank">` +
+      `<img src="/snapshots/${encodeURIComponent(s.name)}${q()}" alt="${esc(s.name)}">` +
       `<div class="muted" style="padding:3px 6px;font-size:11px">${esc(fmt(s.ts))}</div></a>`
     ).join("") || "none saved yet";
     const rows = document.getElementById("rows");
@@ -165,32 +178,46 @@ async function tick() {
         `<td>${esc(e.duration != null ? e.duration + "s" : "—")}</td></tr>`;
     }).join("");
     document.getElementById("src").textContent =
-      `log: ${d.src.log} · snapshots: ${d.src.snaps}`;
+      `log: ${esc(d.src.log)} · snapshots: ${esc(d.src.snaps)}`;
   } catch { /* keep polling */ }
 }
 setInterval(tick, 2500); tick();
 const ck = () => { document.getElementById("clock").textContent =
-                     new Date().toLocaleTimeString(); };
+                     new Date().toLocaleString(); };
 setInterval(ck, 1000); ck();
 </script>
 </body>
 </html>
 """
 
+_SNAP_RE = re.compile(r"\d{8}-\d{6}(?:-\d{3})?\.jpg")
 
-def read_events(path, limit=300):
+
+def read_events(path, limit=300, tail_bytes=1 << 20):
+    """Return the last `limit` events, reading only the file tail.
+
+    Earlier versions parsed the whole log per request (and per poll); the
+    tail read keeps both memory and CPU bounded no matter how big the log
+    grows. Non-JSON and non-object lines are skipped.
+    """
     out = []
     try:
-        with open(path) as fh:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > tail_bytes:
+                fh.seek(size - tail_bytes)
+                fh.readline()                # drop the partial first line
             for ln in fh:
                 ln = ln.strip()
                 if not ln:
                     continue
                 try:
-                    out.append(json.loads(ln))
+                    obj = json.loads(ln)
+                    if isinstance(obj, dict):
+                        out.append(obj)
                 except ValueError:
                     continue
-    except FileNotFoundError:
+    except OSError:
         pass
     return out[-limit:]
 
@@ -200,8 +227,11 @@ def derive_status(events, active_timeout):
     for e in reversed(events):
         t = e.get("type")
         if t == "start":
-            age = time.time() - float(e.get("ts", 0))
-            if age > active_timeout:
+            try:
+                age = time.time() - float(e.get("ts", 0))
+            except (TypeError, ValueError):
+                age = None
+            if age is None or age > active_timeout:
                 return "STALE", age
             return "ACTIVE", age
         if t == "end":
@@ -212,10 +242,19 @@ def derive_status(events, active_timeout):
 def list_snapshots(snapshot_dir, limit=40):
     if not snapshot_dir:
         return []
-    hits = sorted(glob.glob(os.path.join(snapshot_dir, "*.jpg")),
-                  key=os.path.getmtime, reverse=True)
-    return [{"name": os.path.basename(p),
-             "ts": os.path.getmtime(p)} for p in hits[:limit]]
+    try:
+        hits = sorted(glob.glob(os.path.join(snapshot_dir, "*.jpg")),
+                      key=os.path.getmtime, reverse=True)
+    except OSError:
+        return []
+    out = []
+    for p in hits[:limit]:
+        try:
+            out.append({"name": os.path.basename(p),
+                        "ts": os.path.getmtime(p)})
+        except OSError:
+            continue
+    return out
 
 
 def read_state(path):
@@ -229,10 +268,26 @@ def read_state(path):
         return None
 
 
-def make_handler(log_path, snapshot_dir, active_timeout, state_file=None):
+def make_handler(log_path, snapshot_dir, active_timeout, state_file=None,
+                 token=None, heartbeat_timeout=20.0):
+    page = PAGE.replace(_TOKEN_JS, json.dumps(token or ""))
     class Handler(BaseHTTPRequestHandler):
+        timeout = 10.0                      # no per-connection hangs
+
         def log_message(self, fmt, *args):  # quieter
             pass
+
+        def _authed(self, qs):
+            """True if no token configured, or the request carries it."""
+            if not token:
+                return True
+            t = qs.get("t", [""])[0]
+            if t and hmac.compare_digest(t, token):
+                return True
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                return hmac.compare_digest(auth[7:], token)
+            return False
 
         def _json(self, obj, code=200):
             body = json.dumps(obj).encode()
@@ -244,11 +299,17 @@ def make_handler(log_path, snapshot_dir, active_timeout, state_file=None):
             self.wfile.write(body)
 
         def do_GET(self):
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            qs = parse_qs(parsed.query)
+            if not self._authed(qs):
+                self._json({"error": "unauthorized"}, 401)
+                return
             if path in ("/", "/index.html"):
-                body = PAGE.encode()
+                body = page.encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -256,10 +317,18 @@ def make_handler(log_path, snapshot_dir, active_timeout, state_file=None):
             if path == "/api/events":
                 ev = read_events(log_path)
                 state = read_state(state_file)
-                if state is not None and state.get("armed") is False:
-                    status, age = "DISARMED", None
-                else:
-                    status, age = derive_status(ev, active_timeout)
+                status, age = derive_status(ev, active_timeout)
+                if state is not None:
+                    try:
+                        stale = time.time() - float(state.get("ts", 0))
+                    except (TypeError, ValueError):
+                        stale = None
+                    if state.get("armed") is False:
+                        status, age = "DISARMED", None
+                    elif state.get("stream_ok") is False:
+                        status, age = "STREAM-ERR", None
+                    elif stale is not None and stale > heartbeat_timeout:
+                        status, age = "OFFLINE", stale
                 last_seen = None
                 if ev:
                     last_seen = ev[-1].get("ts", time.time())
@@ -269,25 +338,42 @@ def make_handler(log_path, snapshot_dir, active_timeout, state_file=None):
                     "last": ev[-1] if ev else None,
                     "events": ev, "snapshots": list_snapshots(snapshot_dir),
                     "state": state,
-                    "src": {"log": log_path, "snaps": snapshot_dir or "(none)"},
+                    "src": {
+                        "log": os.path.basename(log_path) if log_path else "(none)",
+                        "snaps": (os.path.basename(snapshot_dir)
+                                  if snapshot_dir else "(none)"),
+                    },
                 })
                 return
             if path.startswith("/snapshots/"):
                 name = os.path.basename(unquote(path[len("/snapshots/"):]))
-                if not name:
-                    self._json({"error": "no file"}, 400)
+                # strict name check: only detector snapshot names, no
+                # "../", no dequoting tricks, no symlinked files
+                if not _SNAP_RE.fullmatch(name):
+                    self._json({"error": "bad name"}, 400)
                     return
-                try:
-                    with open(os.path.join(snapshot_dir, name), "rb") as fh:
-                        body = fh.read()
-                except (OSError, TypeError):
-                    self._json({"error": "not found"}, 404)
+                if snapshot_dir:
+                    real_dir = os.path.realpath(snapshot_dir)
+                    real_path = os.path.realpath(os.path.join(real_dir, name))
+                    if not real_path.startswith(real_dir + os.sep):
+                        self._json({"error": "bad name"}, 400)
+                        return
+                    try:
+                        with open(real_path, "rb") as fh:
+                            body = fh.read()
+                    except OSError:
+                        self._json({"error": "not found"}, 404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Content-Disposition",
+                                     "inline; filename=" + name)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                     return
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._json({"error": "no snapshot dir"}, 404)
                 return
             if path == "/healthz":
                 self._json({"ok": True})
@@ -303,16 +389,24 @@ def main(argv=None):
     p.add_argument("--snapshot-dir", default=None)
     p.add_argument("--port", type=int, default=8001)
     p.add_argument("--bind", default="0.0.0.0")
+    p.add_argument("--token", default=None,
+                   help="optional access token; required as ?t=<token> or "
+                        "Authorization: Bearer <token> on every request")
     p.add_argument("--active-timeout", type=float, default=120.0,
                    help="seconds before an unresolved START is STALE")
+    p.add_argument("--heartbeat-timeout", type=float, default=20.0,
+                   help="state.json older than this shows OFFLINE "
+                        "(detector heartbeat runs every ~10 s)")
     p.add_argument("--state-file", default="state.json",
                    help="sentry state.json written by intrusion.py")
     args = p.parse_args(argv)
     handler = make_handler(args.log, args.snapshot_dir, args.active_timeout,
-                           args.state_file)
+                           args.state_file, token=args.token,
+                           heartbeat_timeout=args.heartbeat_timeout)
     srv = ThreadingHTTPServer((args.bind, args.port), handler)
+    auth = f", token={'on' if args.token else 'off'}"
     print(f"dashboard on http://{args.bind}:{args.port}  "
-          f"(log={args.log}, snaps={args.snapshot_dir})")
+          f"(log={args.log}, snaps={args.snapshot_dir}{auth})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

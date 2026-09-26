@@ -67,16 +67,19 @@ START/END transitions, not on individual frames.
 
 ```sh
 sudo cp deploy/pi-intrusion-detection.service /etc/systemd/system/
-sudo cp deploy/pi-intrusion.env.example /etc/pi-intrusion.env
+sudo cp deploy/pi-intrusion.env.example /etc/pi-intrusion.env && \
+    sudo chown root:root /etc/pi-intrusion.env && sudo chmod 600 /etc/pi-intrusion.env
 sudo nano /etc/pi-intrusion.env        # fill tokens
-sudo nano /etc/systemd/system/pi-intrusion-detection.service   # set <CAMERA_URL>
+sudo nano /etc/systemd/system/pi-intrusion-detection.service   # set <CAMERA_URL>,
+    # User= and the %h/... paths to your setup
 sudo systemctl daemon-reload
 sudo systemctl enable --now pi-intrusion-detection
 ```
 
 Follow it with `journalctl -u pi-intrusion-detection -f`. The unit
-`EnvironmentFile`s the tokens, keeps them out of the repo, and restarts the
-watcher on failure.
+`EnvironmentFile`s the tokens (owned by root, chmod 600), keeps them out of
+the repo, and restarts the watcher on failure — including when the camera
+stalls for 30 consecutive reads (~6 s) so a dead stream self-heals.
 
 ## Web dashboard
 
@@ -88,12 +91,16 @@ python3 dashboard.py --log events.jsonl --snapshot-dir snapshots --port 8001
 # open http://<pi-ip>:8001
 ```
 
-Live status pill (**ARMED / ACTIVE / STALE / DISARMED**), last event, a
-snapshot grid, and recent history — auto-refreshes every 2.5 s. When run
-against the sentry's `state.json` it also shows its uptime, fps and last
-remote command, and a **DISARMED** pill whenever the sentry has been told
-to go quiet. Read-only by design. Run it next to the detector; systemd
-unit: `deploy/pi-intrusion-dashboard.service` (port 8001, right next to
+Live status pill (**ARMED / ACTIVE / STALE / DISARMED / OFFLINE /
+STREAM-ERR**), last event, a snapshot grid, and recent history —
+auto-refreshes every 2.5 s. When run against the sentry's `state.json` it
+also shows its uptime, fps and last remote command, a **DISARMED** pill
+whenever the sentry has been told to go quiet, **STREAM-ERR** when the
+detector reports the camera is not producing frames, and **OFFLINE** when
+the heartbeat goes stale. Read-only by design. It serves camera imagery,
+so pass `--token` (or put a reverse proxy in front) whenever it's reachable
+beyond your own machines. Run it next to the detector; systemd unit:
+`deploy/pi-intrusion-dashboard.service` (port 8001, right next to
 presence-vigil's :8000).
 
 | flag | default | meaning |
@@ -101,8 +108,10 @@ presence-vigil's :8000).
 | `--log` | `events.jsonl` | event log to read |
 | `--snapshot-dir` | — | where the detector saves snapshots |
 | `--port` / `--bind` | `8001` / `0.0.0.0` | HTTP listen address |
+| `--token` | — | access token; every request needs `?t=<token>` or `Authorization: Bearer <token>` |
 | `--active-timeout` | `120` | an unresolved START older than this shows **STALE** (detector probably down) |
-| `--state-file` | `state.json` | sentry `state.json` — makes the pill show **DISARMED** and fills uptime/fps/last-cmd |
+| `--heartbeat-timeout` | `20` | `state.json` older than this shows **OFFLINE** (sentry heartbeat runs every ~10 s) |
+| `--state-file` | `state.json` | sentry `state.json` — makes the pill show **DISARMED/OFFLINE/STREAM-ERR** and fills uptime/fps/last-cmd |
 
 ## MQTT payloads
 
@@ -130,7 +139,9 @@ mosquitto_pub -h 127.0.0.1 -t intrusion/control -m '{"command":"status"}'
 Accepted commands: `arm | on | enable | resume`, `disarm | off | disable |
 pause`, and `status | state | ?` (republish state immediately). While
 disarmed no events or alerts fire, but the sentry keeps processing and
-drawing; re-arming starts a fresh watch immediately.
+drawing; re-arming starts a fresh watch immediately. The subscription is
+re-established on every MQTT connect via an `on_connect` handler, so a
+broker restart (or WiFi blip) can never silently kill remote control.
 
 Every `--status-interval` seconds it publishes a **retained** heartbeat to
 `intrusion/status` and writes `state.json` (gitignored) so the dashboard
@@ -152,12 +163,14 @@ guessing from the event log:
 | `--classes` | `person` | comma-separated classes to keep; empty = any |
 | `--stream` | — | video source: integer index or MJPEG/RTSP URL |
 | `--image` | — | single-shot mode: process one image file once |
+| `--output` | — | single-shot mode: write the annotated image here |
 | `--headless` | off | never open a window |
 | `--snapshot-dir` | — | save an annotated snapshot per intrusion START |
 | `--log` | `events.jsonl` | JSONL event log (append-only) |
-| `--quiet-after` | `2.0` | no-detection grace before an event ends (s) |
+| `--quiet-after` | `6.0` | no-detection grace before an event ends (s) |
 | `--event-cooldown` | `30.0` | min seconds between separate events |
-| `--mqtt-broker` | — | enable MQTT events (needs `paho-mqtt`) |
+| `--mqtt-broker` | — | enable MQTT events (needs `paho-mqtt>=2.0`) |
+| `--mqtt-port` | `1883` | MQTT broker port |
 | `--mqtt-control-topic` | `intrusion/control` | topic to arm/disarm the sentry |
 | `--mqtt-status-topic` | `intrusion/status` | retained status heartbeat (MQTT) |
 | `--status-interval` | `10.0` | seconds between state flush + heartbeat |
@@ -184,8 +197,9 @@ pip install -r requirements.txt        # numpy, opencv-python, tensorflow, paho-
 ```
 
 `tensorflow` includes the TFLite interpreter; on a Pi you can substitute the
-lighter `tflite-runtime`. `paho-mqtt` is only needed when `--mqtt-broker` is
-used; Telegram uses only the Python standard library.
+lighter `tflite-runtime`. `paho-mqtt>=2.0` is only needed when
+`--mqtt-broker` is used (the code uses the paho 2.x API);
+Telegram uses only the Python standard library.
 
 ## Notes
 
@@ -196,8 +210,15 @@ used; Telegram uses only the Python standard library.
 - Detection boxes are drawn in the original frame coordinates (letterbox
   scaling is undone); the decode handles the YOLOv5 single-output format
   directly, no external detector libraries.
-- Stream hiccups are handled: if the source drops frames, the current event
-  still ends after `--quiet-after` instead of hanging.
+- Stream failures are handled loudly: a dropped source still ends the
+  current event after `--quiet-after`, the loop backs off instead of
+  spinning the CPU, `state.json` flips `stream_ok` to false (the dashboard
+  shows **STREAM-ERR**), and 30 consecutive failed reads (~6 s) exit so
+  systemd restarts the watcher.
+- The detector publishes a **retained** heartbeat on `intrusion/status`
+  (`online: true`), and flips it to `online: false` on graceful shutdown —
+  combine that with `--heartbeat-timeout` on the dashboard to spot a dead
+  sentry.
 - Throughput on the Pi: this float fp16 model runs at roughly **0.5–1 fps**
   on a Pi 4-class CPU (measured ≈1.9 s/frame with the TFLite XNNPACK
   delegate, plus an ≈18 s cold model load). That's fine for an intrusion

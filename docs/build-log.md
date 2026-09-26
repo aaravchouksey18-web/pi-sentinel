@@ -2,8 +2,8 @@
 
 ## Consolidation — 2026-09-26
 
-Found in `an archive of the original Pi camera test scripts` as `testcode-v18/19/20.py`,
-three generations of the same detector:
+Found in an archive of the original Pi camera test scripts as
+`testcode-v18/19/20.py`, three generations of the same detector:
 
 - **v18** — TensorFlow SavedModel (SSD MobileNet COCO, 300×300), plain
   person detection, ESP32-CAM stream over MJPEG (`http://<camera-ip>:81/stream`).

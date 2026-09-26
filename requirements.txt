@@ -1,9 +1,11 @@
 # core
 numpy
-opencv-python
+opencv-python-headless       # headless service build; opencv-python also works
 
-# TFLite interpreter (either works; tensorflow is the heavier option)
+# TFLite interpreter (either works; tensorflow is the heavier option).
+# On a Raspberry Pi (no armv7 wheels) substitute: pip install tflite-runtime
 tensorflow>=2.8
 
-# optional: MQTT alerts in headless mode
-paho-mqtt
+# optional: MQTT alerts + remote arm/disarm in headless mode.
+# Pinned to >= 2.0 — the code uses the paho 2.x API (CallbackAPIVersion).
+paho-mqtt>=2.0,<3

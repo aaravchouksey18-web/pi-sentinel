@@ -46,7 +46,7 @@ def load_labels(path):
     if not path or not os.path.exists(path):
         return None
     names = []
-    with open(path, "r") as fh:
+    with open(path, "r", encoding="utf-8") as fh:
         for ln in fh:
             s = ln.strip()
             if not s or s.startswith("#"):
@@ -123,29 +123,35 @@ def nms(dets, iou_threshold=0.45):
     return [dets[j] for j in keep]
 
 
-def filter_classes(dets, wanted, labels):
-    """Keep only detections whose class is in `wanted` (names or ids).
+def resolve_wanted_ids(wanted, labels):
+    """Map `wanted` class names/ids to model indices (empty = nothing matched).
 
     With a labels file, names are resolved through it. Without one,
     "person" falls back to class id 2 — measured on this model: class
     index 2 fires on a person (see docs/build-log.md).
     """
-    if not wanted:                                  # empty list => any class
-        return dets
-    wanted_ids = set()
+    ids = set()
     for raw in wanted:
         name = raw.strip().lower()
         if labels:
             for i, lab in enumerate(labels):
                 if lab.strip().lower() == name:
-                    wanted_ids.add(i)
+                    ids.add(i)
         elif name == "person":
-            wanted_ids.add(2)
+            ids.add(2)
         else:
             try:
-                wanted_ids.add(int(name))
+                ids.add(int(name))
             except ValueError:
                 pass
+    return ids
+
+
+def filter_classes(dets, wanted, labels):
+    """Keep only detections whose class is in `wanted` (names or ids)."""
+    if not wanted:                                  # empty list => any class
+        return dets
+    wanted_ids = resolve_wanted_ids(wanted, labels)
     return [d for d in dets if d["class_id"] in wanted_ids]
 
 
@@ -240,12 +246,12 @@ class Notifier:
         self.armed = not getattr(args, "start_disarmed", False)
         self.last_command = None
         self.want_status = False
+        self._last_io_warn = 0.0
 
         # JSONL event log
         if args.log:
-            with open(args.log, "a") as fh:
-                fh.write(f'{{"ts": {time.time():.3f}, "type": "boot", '
-                         f'"source": "{args.stream or args.image}"}}\n')
+            self.log_line({"ts": time.time(), "type": "boot",
+                           "source": args.stream or args.image})
 
         # MQTT
         self.mqtt_client = None
@@ -253,14 +259,33 @@ class Notifier:
             try:
                 import paho.mqtt.client as mqtt
             except ImportError:
-                sys.exit("--mqtt-broker needs paho-mqtt: pip install paho-mqtt")
-            self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-            self.mqtt_client.connect(args.mqtt_broker, args.mqtt_port, 30)
-            self.mqtt_client.loop_start()
-            # remote arm/disarm + status queries ride on the control topic
+                sys.exit("--mqtt-broker needs paho-mqtt: "
+                         "pip install 'paho-mqtt>=2.0'")
+            if hasattr(mqtt, "CallbackAPIVersion"):
+                self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+            else:                       # paho 1.x fallback (works the same)
+                self.mqtt_client = mqtt.Client()
+
+            def _on_connect(client, userdata, flags, *args):
+                # (re)subscribe here: paho's auto-reconnect does NOT restore
+                # subscriptions, so without this a broker restart would
+                # silently kill arm/disarm forever.
+                client.subscribe(self.args.mqtt_control_topic)
+                print(f"mqtt: connected; subscribed to "
+                      f"{self.args.mqtt_control_topic}", flush=True)
+
+            self.mqtt_client.on_connect = _on_connect
             self.mqtt_client.on_message = self._on_control
-            self.mqtt_client.subscribe(getattr(args, "mqtt_control_topic",
-                                               "intrusion/control"))
+            self.mqtt_client.max_queued_messages_set(100)
+            try:
+                self.mqtt_client.connect(args.mqtt_broker, args.mqtt_port, 30)
+            except OSError as e:
+                print(f"warning: mqtt broker {args.mqtt_broker}:{args.mqtt_port} "
+                      f"unavailable ({e}) — running without MQTT control",
+                      flush=True)
+                self.mqtt_client = None
+            else:
+                self.mqtt_client.loop_start()
 
         # Telegram (env-driven; silently off unless both vars present)
         self.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -271,10 +296,20 @@ class Notifier:
             print("warning: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID must both be set")
 
     # -- event log -------------------------------------------------------- #
+    def _warn_io(self, msg):
+        now = time.time()
+        if now - self._last_io_warn >= 30.0:        # don't spam the journal
+            self._last_io_warn = now
+            print(f"warning: {msg}", flush=True)
+
     def log_line(self, entry):
-        if self.args.log:
-            with open(self.args.log, "a") as fh:
+        if not self.args.log:
+            return
+        try:
+            with open(self.args.log, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry) + "\n")
+        except OSError as e:
+            self._warn_io(f"event log write failed: {e}")
 
     # -- mqtt ------------------------------------------------------------- #
     def mqtt_publish(self, payload):
@@ -315,6 +350,7 @@ class Notifier:
                 print("telegram: photo alert sent")
         except Exception as e:
             print("telegram sendPhoto failed:", e)
+            self.telegram_send_text("(photo failed) " + caption)
 
     def telegram_send_text(self, text):
         if not (self.telegram_token and self.telegram_chat):
@@ -413,7 +449,7 @@ def build_parser():
                    help="save an annotated snapshot per intrusion event")
     p.add_argument("--log", default="events.jsonl",
                    help="JSONL event log (default events.jsonl)")
-    p.add_argument("--quiet-after", type=float, default=2.0,
+    p.add_argument("--quiet-after", type=float, default=6.0,
                    help="no-detection grace before an EVENT ends (s)")
     p.add_argument("--event-cooldown", type=float, default=30.0,
                    help="min seconds between separate intrusion events")
@@ -444,12 +480,20 @@ def main(argv=None):
     wanted = [c for c in args.classes.split(",") if c.strip()] if args.classes else []
     if wanted:
         print(f"filter: {args.classes}")
+        if not resolve_wanted_ids(wanted, labels):
+            sys.exit(f"--classes {args.classes!r} matched nothing "
+                     "(is --labels missing, or do the class names differ?) — "
+                     "refusing to run a sentry that can never fire")
 
     notify = Notifier(args, labels)
     print(f"loading model {args.model} ...")
     det = Detector(args.model, args.threshold, labels, wanted)
 
-    os.makedirs(args.snapshot_dir, exist_ok=True) if args.snapshot_dir else None
+    if args.snapshot_dir:
+        try:
+            os.makedirs(args.snapshot_dir, exist_ok=True)
+        except OSError as e:
+            sys.exit(f"cannot create snapshot dir {args.snapshot_dir}: {e}")
 
     # ------------------------------------------------------------------ #
     # single image mode
@@ -458,6 +502,8 @@ def main(argv=None):
         if not os.path.exists(args.image):
             sys.exit(f"image not found: {args.image}")
         frame = cv2.imread(args.image)
+        if frame is None:
+            sys.exit(f"cannot read image: {args.image}")
         ts = time.time()
         dets = det.detect(frame)
         annotated = draw(frame.copy(), dets, labels, active=bool(dets),
@@ -476,10 +522,14 @@ def main(argv=None):
     # ------------------------------------------------------------------ #
     # live stream mode (event engine)
     # ------------------------------------------------------------------ #
-    cap = cv2.VideoCapture(args.stream)
+    # "0" (or any digits) means a webcam index; anything else is a URL/file.
+    src = (args.stream or "").strip()
+    cap = cv2.VideoCapture(int(src) if src.lstrip("+-").isdigit() else src)
     if not cap.isOpened():
-        sys.exit(f"cannot open stream: {args.stream}")
-    print(f"watching {args.stream} (Ctrl+C to stop)")
+        sys.exit(f"cannot open stream: {src}")
+    # don't hang forever inside cap.read() when the stream stalls
+    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+    print(f"watching {src} (Ctrl+C to stop)")
 
     boot_ts = time.time()
     active = False
@@ -491,11 +541,13 @@ def main(argv=None):
     prev = time.time()
     last_flush = 0.0
     prev_armed = None
+    stream_ok = True
+    stream_fails = 0
 
     def maybe_end(now):
         """Close the current event once the quiet grace period has passed."""
         nonlocal active, last_event_end, event_start_ts
-        if active and (now - last_seen_ts) >= args.quiet_after:
+        if active and notify.armed and (now - last_seen_ts) >= args.quiet_after:
             active = False
             print(f"[{now:.3f}] EVENT END — lasted "
                   f"{now - event_start_ts:.1f}s", flush=True)
@@ -507,38 +559,59 @@ def main(argv=None):
             "ts": round(now, 3),
             "armed": bool(notify.armed),
             "active": bool(active),
+            "stream_ok": stream_ok,
+            "online": True,
             "fps": round(fps, 1),
             "uptime": round(now - boot_ts, 1),
             "last_event": last_event_ts,
             "last_command": notify.last_command,
         }
 
-    def flush_state(now):
-        if args.state_file:
-            tmp = args.state_file + ".tmp"
-            with open(tmp, "w") as fh:
+    def write_state_atomic(now):
+        if not args.state_file:
+            return
+        tmp = args.state_file + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(sentry_state(now), fh)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, args.state_file)
+        except OSError as e:
+            notify._warn_io(f"state write failed: {e}")
+
+    def flush_state(now):
+        write_state_atomic(now)
         if notify.mqtt_client:
             notify.publish_status(sentry_state(now))
 
     def process(frame, now):
-        nonlocal active, event_start_ts, last_seen_ts, last_event_end, fps, prev_armed, last_event_ts
-        dt = now - prev if now > prev else 1e-6
-        fps = 0.9 * fps + 0.1 * (1.0 / dt if dt > 0 else 0.0)
+        nonlocal active, event_start_ts, last_seen_ts, last_event_end, \
+            prev_armed, last_event_ts, fps
+        dt = now - prev
+        if dt > 0:                                  # guard against clock steps
+            fps = 0.9 * fps + 0.1 * (1.0 / dt)
 
-        armed = notify.armed
+        dets = det.detect(frame)
+        armed = notify.armed        # read after inference: a disarm lands ~1 frame
         if prev_armed is not None and armed != prev_armed:
             if armed:
                 print("[control] re-armed — fresh watch", flush=True)
                 last_event_end = -999999.0
             else:
+                if active:
+                    # log the end explicitly so the dashboard doesn't stay ACTIVE
+                    notify.log_line({"type": "end", "ts": round(now, 3),
+                                     "start": round(event_start_ts, 3),
+                                     "duration": round(now - event_start_ts, 2),
+                                     "detections": [], "reason": "disarmed"})
+                    print(f"[{now:.3f}] EVENT END (disarmed) — lasted "
+                          f"{now - event_start_ts:.1f}s", flush=True)
                 print("[control] disarmed — events suppressed", flush=True)
             active = False
             event_start_ts = None
         prev_armed = armed
 
-        dets = det.detect(frame)
         if dets:
             if armed:
                 last_seen_ts = now
@@ -549,12 +622,18 @@ def main(argv=None):
                     last_event_ts = now
                     snap = None
                     if args.snapshot_dir:
+                        # ms resolution so two starts in the same second
+                        # can't silently overwrite each other
+                        millis = int(round((now - int(now)) * 1000))
                         snap = os.path.join(
                             args.snapshot_dir,
-                            time.strftime("%Y%m%d-%H%M%S") + ".jpg")
-                        cv2.imwrite(snap, draw(frame.copy(), dets, labels,
-                                               active=True, armed=True))
-                        print(f"snapshot: {snap}", flush=True)
+                            time.strftime("%Y%m%d-%H%M%S") + f"-{millis:03d}.jpg")
+                        if not cv2.imwrite(snap, draw(frame.copy(), dets, labels,
+                                                      active=True, armed=True)):
+                            print("warning: failed to write snapshot", flush=True)
+                            snap = None
+                        else:
+                            print(f"snapshot: {snap}", flush=True)
                     print(f"[{now:.3f}] EVENT START — {len(dets)} "
                           f"detection(s): "
                           + ", ".join(f"{class_name(d, labels)} "
@@ -570,14 +649,32 @@ def main(argv=None):
                     (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         return annotated
 
+    import signal
+    signal.signal(signal.SIGTERM,
+                  lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+
     try:
         while True:
             ok, frame = cap.read()
             now = time.time()
             if not ok:
-                # stream hiccup / EOF: still close events gracefully
+                # stream hiccup / EOF: still close events gracefully, but
+                # back off instead of spinning at 100% CPU — and if it stays
+                # dead, exit so systemd (Restart=on-failure) brings it back.
                 maybe_end(now)
+                stream_ok = False
+                stream_fails += 1
+                if stream_fails == 1:
+                    print(f"[{now:.3f}] stream error — camera not producing "
+                          f"frames ({src})", flush=True)
+                time.sleep(0.2)
+                if stream_fails >= 30:
+                    write_state_atomic(now)         # last state; stream_ok False
+                    sys.exit("stream dead for 30 consecutive reads — "
+                             "restarting (systemd Restart=on-failure)")
             else:
+                stream_ok = True
+                stream_fails = 0
                 annotated = process(frame, now)
                 prev = now
                 if not args.headless:
@@ -595,6 +692,8 @@ def main(argv=None):
         if not args.headless:
             cv2.destroyAllWindows()
         if notify.mqtt_client:
+            # drop the retained heartbeat so the dashboard shows OFFLINE
+            notify.publish_status({"online": False, "ts": time.time()})
             notify.mqtt_client.loop_stop()
 
 
