@@ -88,10 +88,12 @@ python3 dashboard.py --log events.jsonl --snapshot-dir snapshots --port 8001
 # open http://<pi-ip>:8001
 ```
 
-Live status pill (**ARMED / ACTIVE / STALE**), last event, a snapshot
-grid, and recent history — auto-refreshes every 2.5 s. Read-only by
-design. Run it next to the detector; systemd unit:
-`deploy/pi-intrusion-dashboard.service` (port 8001, right next to
+Live status pill (**ARMED / ACTIVE / STALE / DISARMED**), last event, a
+snapshot grid, and recent history — auto-refreshes every 2.5 s. When run
+against the sentry's `state.json` it also shows its uptime, fps and last
+remote command, and a **DISARMED** pill whenever the sentry has been told
+to go quiet. Read-only by design. Run it next to the detector; systemd
+unit: `deploy/pi-intrusion-dashboard.service` (port 8001, right next to
 presence-vigil's :8000).
 
 | flag | default | meaning |
@@ -100,6 +102,7 @@ presence-vigil's :8000).
 | `--snapshot-dir` | — | where the detector saves snapshots |
 | `--port` / `--bind` | `8001` / `0.0.0.0` | HTTP listen address |
 | `--active-timeout` | `120` | an unresolved START older than this shows **STALE** (detector probably down) |
+| `--state-file` | `state.json` | sentry `state.json` — makes the pill show **DISARMED** and fills uptime/fps/last-cmd |
 
 ## MQTT payloads
 
@@ -111,6 +114,32 @@ Topic: `intrusion/events` (default). JSON per event:
  "snapshot": "snapshots/20260926-150000.jpg"}
 {"type": "end", "ts": 1790421238.12, "start": 1790421234.56,
  "duration": 3.56, "detections": []}
+```
+
+## MQTT control & status
+
+The sentry listens on `intrusion/control` (default) for arm / disarm
+commands — plain strings or JSON:
+
+```sh
+mosquitto_pub -h 127.0.0.1 -t intrusion/control -m disarm      # go quiet
+mosquitto_pub -h 127.0.0.1 -t intrusion/control -m arm
+mosquitto_pub -h 127.0.0.1 -t intrusion/control -m '{"command":"status"}'
+```
+
+Accepted commands: `arm | on | enable | resume`, `disarm | off | disable |
+pause`, and `status | state | ?` (republish state immediately). While
+disarmed no events or alerts fire, but the sentry keeps processing and
+drawing; re-arming starts a fresh watch immediately.
+
+Every `--status-interval` seconds it publishes a **retained** heartbeat to
+`intrusion/status` and writes `state.json` (gitignored) so the dashboard
+shows the true sentry state — including a **DISARMED** pill — instead of
+guessing from the event log:
+
+```json
+{"ts": 1790421234.5, "armed": false, "active": false, "fps": 0.5,
+ "uptime": 1234.5, "last_event": null, "last_command": {"cmd": "disarm", "ts": 1790421230.1}}
 ```
 
 ## Options
@@ -129,6 +158,11 @@ Topic: `intrusion/events` (default). JSON per event:
 | `--quiet-after` | `2.0` | no-detection grace before an event ends (s) |
 | `--event-cooldown` | `30.0` | min seconds between separate events |
 | `--mqtt-broker` | — | enable MQTT events (needs `paho-mqtt`) |
+| `--mqtt-control-topic` | `intrusion/control` | topic to arm/disarm the sentry |
+| `--mqtt-status-topic` | `intrusion/status` | retained status heartbeat (MQTT) |
+| `--status-interval` | `10.0` | seconds between state flush + heartbeat |
+| `--state-file` | `state.json` | sentry state JSON (read by the dashboard) |
+| `--start-disarmed` | off | boot disarmed until armed via MQTT |
 
 Telegram is configured exclusively through `TELEGRAM_BOT_TOKEN` /
 `TELEGRAM_CHAT_ID` env vars (see `deploy/pi-intrusion.env.example`).

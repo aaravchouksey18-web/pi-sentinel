@@ -86,3 +86,24 @@ Turned the single script into an event-driven sentry:
   snapshot JPEG; status transitions checked against the log tail
   (empty log → ARMED, unresolved start → ACTIVE, stale start → STALE,
   appended end → ARMED with history).
+
+## Pass 3 — MQTT control plane (2026-09-26)
+
+- `intrusion.py` now listens on `intrusion/control` for arm/disarm commands
+  (`arm|on|enable|resume`, `disarm|off|disable|pause`, `status|state|?`, plain
+  strings or JSON). Commands are processed on its own MQTT client, subscribed
+  *before* the model loads so early commands are not missed.
+- When disarmed: events/alerts/snapshots are suppressed but frames still get
+  processed and drawn; re-arming starts a fresh watch (cooldown reset).
+- Each `--status-interval` (default 10 s) the sentry writes `state.json`
+  (gitignored) and publishes a **retained** heartbeat on `intrusion/status`
+  with `{ts, armed, active, fps, uptime, last_event, last_command}` — so
+  subscribers see live armed state even before any event.
+- `dashboard.py` reads `state.json` (optional `--state-file`): shows a
+  dashed-grey **DISARMED** pill when the sentry is disarmed, plus uptime /
+  fps / last remote command in the status card.
+- New flags on both tools; `state.json` added to `.gitignore`.
+- Verified on the Pi (details in the commit message + test transcript):
+  image-mode disarm gate, MQTT control round-trips (disarm → armed=False,
+  arm → True, `status` → immediate republish), retained heartbeats observed
+  on `intrusion/status`, `state.json` toggling, DISARMED pill rendering.

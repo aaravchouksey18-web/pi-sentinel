@@ -165,10 +165,13 @@ def class_name(d, labels):
     return f"class-{d['class_id']}"
 
 
-def draw(frame, dets, labels, active=False):
+def draw(frame, dets, labels, active=False, armed=True):
     """Boxes + labels + score bars + status overlay."""
-    status = "ACTIVE" if active else "ARMED"
-    color = (0, 0, 255) if active else (0, 255, 0)
+    if not armed:
+        status, color = "DISARMED", (140, 140, 140)
+    else:
+        status, color = ("ACTIVE" if active else "ARMED",
+                         (0, 0, 255) if active else (0, 255, 0))
     for d in dets:
         x1, y1, x2, y2 = (int(round(v)) for v in (d["x1"], d["y1"], d["x2"], d["y2"]))
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -234,6 +237,9 @@ class Notifier:
     def __init__(self, args, labels):
         self.args = args
         self.labels = labels
+        self.armed = not getattr(args, "start_disarmed", False)
+        self.last_command = None
+        self.want_status = False
 
         # JSONL event log
         if args.log:
@@ -251,6 +257,10 @@ class Notifier:
             self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
             self.mqtt_client.connect(args.mqtt_broker, args.mqtt_port, 30)
             self.mqtt_client.loop_start()
+            # remote arm/disarm + status queries ride on the control topic
+            self.mqtt_client.on_message = self._on_control
+            self.mqtt_client.subscribe(getattr(args, "mqtt_control_topic",
+                                               "intrusion/control"))
 
         # Telegram (env-driven; silently off unless both vars present)
         self.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -318,6 +328,35 @@ class Notifier:
         except Exception as e:
             print("telegram sendMessage failed:", e)
 
+    # -- control plane ---------------------------------------------------- #
+    def _on_control(self, client, userdata, msg):
+        """Handle arm/disarm/status messages on the control topic."""
+        raw = msg.payload.decode(errors="replace").strip()
+        try:
+            data = json.loads(raw)
+            cmd = (str(data.get("command") or data.get("cmd") or "").lower()
+                   if isinstance(data, dict) else str(data).lower())
+        except ValueError:
+            cmd = raw.lower()
+        now = time.time()
+        if cmd in ("arm", "on", "enable", "resume"):
+            self.armed = True
+            action = "armed"
+        elif cmd in ("disarm", "off", "disable", "pause"):
+            self.armed = False
+            action = "disarmed"
+        else:
+            action = None                       # "status" / "state" / "?"
+        self.last_command = {"cmd": cmd or "status", "ts": round(now, 3)}
+        self.want_status = True
+        if action:
+            print(f"[control] {action} ({msg.topic})", flush=True)
+
+    def publish_status(self, payload):
+        if self.mqtt_client:
+            self.mqtt_client.publish(self.args.mqtt_status_topic,
+                                     json.dumps(payload), retain=True)
+
     # -- events ----------------------------------------------------------- #
     def fire_start(self, dets, ts, snapshot_path=None):
         payload = {"type": "start", "ts": round(ts, 3),
@@ -381,6 +420,16 @@ def build_parser():
     p.add_argument("--mqtt-broker", default=None, help="MQTT broker host (alerts)")
     p.add_argument("--mqtt-port", type=int, default=1883)
     p.add_argument("--mqtt-topic", default="intrusion/events")
+    p.add_argument("--mqtt-control-topic", default="intrusion/control",
+                   help="MQTT topic to arm/disarm the sentry")
+    p.add_argument("--mqtt-status-topic", default="intrusion/status",
+                   help="MQTT retained status heartbeat topic")
+    p.add_argument("--status-interval", type=float, default=10.0,
+                   help="seconds between state flush + status heartbeat")
+    p.add_argument("--state-file", default="state.json",
+                   help="write sentry state here as JSON (for the dashboard)")
+    p.add_argument("--start-disarmed", action="store_true",
+                   help="boot disarmed; arm later via MQTT control")
     return p
 
 
@@ -396,9 +445,9 @@ def main(argv=None):
     if wanted:
         print(f"filter: {args.classes}")
 
+    notify = Notifier(args, labels)
     print(f"loading model {args.model} ...")
     det = Detector(args.model, args.threshold, labels, wanted)
-    notify = Notifier(args, labels)
 
     os.makedirs(args.snapshot_dir, exist_ok=True) if args.snapshot_dir else None
 
@@ -411,14 +460,15 @@ def main(argv=None):
         frame = cv2.imread(args.image)
         ts = time.time()
         dets = det.detect(frame)
-        annotated = draw(frame.copy(), dets, labels, active=bool(dets))
+        annotated = draw(frame.copy(), dets, labels, active=bool(dets),
+                         armed=notify.armed)
         if dets:
             print(f"[{ts:.3f}] {len(dets)} detection(s): "
                   + ", ".join(f"{class_name(d, labels)} {d['score']:.2f}"
                               for d in dets), flush=True)
         out_path = args.output or "annotated.jpg"
         cv2.imwrite(out_path, annotated)
-        if dets:
+        if dets and notify.armed:
             notify.fire_start(dets, ts, snapshot_path=out_path)
         print(f"wrote {out_path}")
         return
@@ -431,12 +481,16 @@ def main(argv=None):
         sys.exit(f"cannot open stream: {args.stream}")
     print(f"watching {args.stream} (Ctrl+C to stop)")
 
+    boot_ts = time.time()
     active = False
     event_start_ts = None
+    last_event_ts = None
     last_seen_ts = 0.0
     last_event_end = -999999.0
     fps = 0.0
     prev = time.time()
+    last_flush = 0.0
+    prev_armed = None
 
     def maybe_end(now):
         """Close the current event once the quiet grace period has passed."""
@@ -448,34 +502,70 @@ def main(argv=None):
             notify.fire_end([], now, event_start_ts)
             last_event_end = now
 
+    def sentry_state(now):
+        return {
+            "ts": round(now, 3),
+            "armed": bool(notify.armed),
+            "active": bool(active),
+            "fps": round(fps, 1),
+            "uptime": round(now - boot_ts, 1),
+            "last_event": last_event_ts,
+            "last_command": notify.last_command,
+        }
+
+    def flush_state(now):
+        if args.state_file:
+            tmp = args.state_file + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(sentry_state(now), fh)
+            os.replace(tmp, args.state_file)
+        if notify.mqtt_client:
+            notify.publish_status(sentry_state(now))
+
     def process(frame, now):
-        nonlocal active, event_start_ts, last_seen_ts, last_event_end, fps
+        nonlocal active, event_start_ts, last_seen_ts, last_event_end, fps, prev_armed, last_event_ts
         dt = now - prev if now > prev else 1e-6
         fps = 0.9 * fps + 0.1 * (1.0 / dt if dt > 0 else 0.0)
 
+        armed = notify.armed
+        if prev_armed is not None and armed != prev_armed:
+            if armed:
+                print("[control] re-armed — fresh watch", flush=True)
+                last_event_end = -999999.0
+            else:
+                print("[control] disarmed — events suppressed", flush=True)
+            active = False
+            event_start_ts = None
+        prev_armed = armed
+
         dets = det.detect(frame)
         if dets:
-            last_seen_ts = now
-
-            if not active and (now - last_event_end) >= args.event_cooldown:
-                # ----- new intrusion event -------------------------------- #
-                active = True
-                event_start_ts = now
-                snap = None
-                if args.snapshot_dir:
-                    snap = os.path.join(
-                        args.snapshot_dir,
-                        time.strftime("%Y%m%d-%H%M%S") + ".jpg")
-                    cv2.imwrite(snap, draw(frame.copy(), dets, labels, active=True))
-                    print(f"snapshot: {snap}", flush=True)
-                print(f"[{now:.3f}] EVENT START — {len(dets)} detection(s): "
-                      + ", ".join(f"{class_name(d, labels)} {d['score']:.2f}"
-                                  for d in dets), flush=True)
-                notify.fire_start(dets, now, snapshot_path=snap)
+            if armed:
+                last_seen_ts = now
+                if not active and (now - last_event_end) >= args.event_cooldown:
+                    # ----- new intrusion event ---------------------------- #
+                    active = True
+                    event_start_ts = now
+                    last_event_ts = now
+                    snap = None
+                    if args.snapshot_dir:
+                        snap = os.path.join(
+                            args.snapshot_dir,
+                            time.strftime("%Y%m%d-%H%M%S") + ".jpg")
+                        cv2.imwrite(snap, draw(frame.copy(), dets, labels,
+                                               active=True, armed=True))
+                        print(f"snapshot: {snap}", flush=True)
+                    print(f"[{now:.3f}] EVENT START — {len(dets)} "
+                          f"detection(s): "
+                          + ", ".join(f"{class_name(d, labels)} "
+                                      f"{d['score']:.2f}" for d in dets),
+                          flush=True)
+                    notify.fire_start(dets, now, snapshot_path=snap)
         else:
             maybe_end(now)
 
-        annotated = draw(frame.copy(), dets, labels, active=active)
+        annotated = draw(frame.copy(), dets, labels, active=active,
+                         armed=armed)
         cv2.putText(annotated, f"{fps:.1f} fps",
                     (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         return annotated
@@ -487,14 +577,17 @@ def main(argv=None):
             if not ok:
                 # stream hiccup / EOF: still close events gracefully
                 maybe_end(now)
-                time.sleep(0.5)
-                continue
-            annotated = process(frame, now)
-            prev = now
-            if not args.headless:
-                cv2.imshow("Intrusion Detection", annotated)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+            else:
+                annotated = process(frame, now)
+                prev = now
+                if not args.headless:
+                    cv2.imshow("Intrusion Detection", annotated)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+            if notify.want_status or now - last_flush >= args.status_interval:
+                flush_state(now)
+                last_flush = now
+                notify.want_status = False
     except KeyboardInterrupt:
         print("\nstopped")
     finally:

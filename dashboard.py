@@ -49,6 +49,7 @@ PAGE = """<!doctype html>
   .ACTIVE { background:#33120f; color:var(--bad); border:1px solid var(--bad);
             animation:pulse 1.1s ease-in-out infinite; }
   .STALE  { background:#2b2306; color:var(--warn); border:1px solid var(--warn); }
+  .DISARMED { background:#1c2026; color:#9aa7b4; border:1px dashed #55606b; }
   @keyframes pulse { 50% { opacity:.45; } }
   main { display:grid; grid-template-columns: minmax(280px, 340px) 1fr;
          gap:16px; padding:16px 20px; }
@@ -86,6 +87,9 @@ PAGE = """<!doctype html>
       <h2>status</h2>
       <div class="kv">
         <b>state</b><span id="st">…</span>
+        <b>uptime</b><span id="up" class="muted">—</span>
+        <b>fps</b><span id="sfps" class="muted">—</span>
+        <b>last cmd</b><span id="cmd" class="muted">—</span>
         <b>last seen</b><span id="lastseenv" class="muted">—</span>
         <b>events</b><span id="evcount">0</span>
         <b>snapshots</b><span id="shcount">0</span>
@@ -127,6 +131,14 @@ async function tick() {
       d.last_seen ? fmt(d.last_seen) : "—";
     document.getElementById("evcount").textContent = d.events.length;
     document.getElementById("shcount").textContent = d.snapshots.length;
+    const stt = d.state;
+    document.getElementById("up").textContent =
+      stt ? Math.round(stt.uptime) + "s" : "—";
+    document.getElementById("sfps").textContent =
+      stt ? stt.fps + " fps" : "—";
+    const lc = stt && stt.last_command;
+    document.getElementById("cmd").textContent =
+      lc ? lc.cmd + " · " + new Date(lc.ts * 1000).toLocaleTimeString() : "—";
     const lsev = document.getElementById("lastsev");
     if (d.last) {
       const e = d.last;
@@ -206,7 +218,18 @@ def list_snapshots(snapshot_dir, limit=40):
              "ts": os.path.getmtime(p)} for p in hits[:limit]]
 
 
-def make_handler(log_path, snapshot_dir, active_timeout):
+def read_state(path):
+    """Load the sentry state.json written by intrusion.py, if present."""
+    if not path:
+        return None
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def make_handler(log_path, snapshot_dir, active_timeout, state_file=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # quieter
             pass
@@ -232,7 +255,11 @@ def make_handler(log_path, snapshot_dir, active_timeout):
                 return
             if path == "/api/events":
                 ev = read_events(log_path)
-                status, age = derive_status(ev, active_timeout)
+                state = read_state(state_file)
+                if state is not None and state.get("armed") is False:
+                    status, age = "DISARMED", None
+                else:
+                    status, age = derive_status(ev, active_timeout)
                 last_seen = None
                 if ev:
                     last_seen = ev[-1].get("ts", time.time())
@@ -241,6 +268,7 @@ def make_handler(log_path, snapshot_dir, active_timeout):
                     "last_seen": last_seen,
                     "last": ev[-1] if ev else None,
                     "events": ev, "snapshots": list_snapshots(snapshot_dir),
+                    "state": state,
                     "src": {"log": log_path, "snaps": snapshot_dir or "(none)"},
                 })
                 return
@@ -277,8 +305,11 @@ def main(argv=None):
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--active-timeout", type=float, default=120.0,
                    help="seconds before an unresolved START is STALE")
+    p.add_argument("--state-file", default="state.json",
+                   help="sentry state.json written by intrusion.py")
     args = p.parse_args(argv)
-    handler = make_handler(args.log, args.snapshot_dir, args.active_timeout)
+    handler = make_handler(args.log, args.snapshot_dir, args.active_timeout,
+                           args.state_file)
     srv = ThreadingHTTPServer((args.bind, args.port), handler)
     print(f"dashboard on http://{args.bind}:{args.port}  "
           f"(log={args.log}, snaps={args.snapshot_dir})")

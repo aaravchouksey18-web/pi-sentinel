@@ -12,6 +12,7 @@ tensorflow_models/
 # runtime output
 snapshots/
 events.jsonl
+state.json
 annotated.jpg
 output.jpg
 
