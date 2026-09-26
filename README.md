@@ -120,7 +120,7 @@ Topic: `intrusion/events` (default). JSON per event:
 ```json
 {"type": "start", "ts": 1790421234.56, "detections": [
    {"class_id": 2, "score": 0.97, "bbox": [12.0, 40.0, 200.0, 235.0]}],
- "snapshot": "snapshots/20260926-150000.jpg"}
+ "snapshot": "snapshots/20260926-150000-244.jpg"}
 {"type": "end", "ts": 1790421238.12, "start": 1790421234.56,
  "duration": 3.56, "detections": []}
 ```
@@ -150,7 +150,8 @@ guessing from the event log:
 
 ```json
 {"ts": 1790421234.5, "armed": false, "active": false, "fps": 0.5,
- "uptime": 1234.5, "last_event": null, "last_command": {"cmd": "disarm", "ts": 1790421230.1}}
+ "uptime": 1234.5, "stream_ok": true, "online": true,
+ "last_event": null, "last_command": {"cmd": "disarm", "ts": 1790421230.1}}
 ```
 
 ## Options
@@ -210,15 +211,20 @@ Telegram uses only the Python standard library.
 - Detection boxes are drawn in the original frame coordinates (letterbox
   scaling is undone); the decode handles the YOLOv5 single-output format
   directly, no external detector libraries.
-- Stream failures are handled loudly: a dropped source still ends the
-  current event after `--quiet-after`, the loop backs off instead of
+- Stream failures are handled loudly: a dropped source closes an in-progress
+  event with `"reason": "stream_lost"`, the loop backs off instead of
   spinning the CPU, `state.json` flips `stream_ok` to false (the dashboard
-  shows **STREAM-ERR**), and 30 consecutive failed reads (~6 s) exit so
-  systemd restarts the watcher.
+  briefly shows **STREAM-ERR**, then **OFFLINE** once the file goes stale),
+  and 30 consecutive failed reads (~6 s) exit so systemd restarts the
+  watcher.
 - The detector publishes a **retained** heartbeat on `intrusion/status`
-  (`online: true`), and flips it to `online: false` on graceful shutdown —
-  combine that with `--heartbeat-timeout` on the dashboard to spot a dead
-  sentry.
+  (`online: true`) and flips it to `online: false` on graceful shutdown, so
+  other MQTT consumers can watch for a dead sentry. The dashboard itself
+  does not subscribe to MQTT — it reads `state.json`, and flags **OFFLINE**
+  once that file is older than `--heartbeat-timeout`.
+- Display mode needs a GUI-capable OpenCV: the `requirements.txt` build
+  ships `opencv-python-headless` (for the headless service), which has no
+  `cv2.imshow` — install `opencv-python` instead to use the live window.
 - Throughput on the Pi: this float fp16 model runs at roughly **0.5–1 fps**
   on a Pi 4-class CPU (measured ≈1.9 s/frame with the TFLite XNNPACK
   delegate, plus an ≈18 s cold model load). That's fine for an intrusion

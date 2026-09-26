@@ -44,7 +44,7 @@ Found in an archive of the original Pi camera test scripts as
 Turned the single script into an event-driven sentry:
 
 - **Event engine** — alerts/snapshots/MQTT/log fire on START/END transitions
-  instead of every frame. `--quiet-after` (default 2.0 s) ends an event once
+  instead of every frame. `--quiet-after` (default 6.0 s) ends an event once
   the frame goes quiet; `--event-cooldown` (default 30.0 s) re-arms it so a
   person walking back past the camera doesn't re-trigger spam.
 - **Telegram alerts** — free, stdlib-only (multipart `sendPhoto` via

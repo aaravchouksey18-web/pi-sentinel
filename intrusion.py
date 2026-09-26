@@ -277,15 +277,17 @@ class Notifier:
             self.mqtt_client.on_connect = _on_connect
             self.mqtt_client.on_message = self._on_control
             self.mqtt_client.max_queued_messages_set(100)
+            # connect_async + loop_start: paho keeps retrying in the
+            # background until the broker appears, so a broker down at
+            # startup cannot permanently disable MQTT control.
             try:
-                self.mqtt_client.connect(args.mqtt_broker, args.mqtt_port, 30)
+                self.mqtt_client.connect_async(args.mqtt_broker,
+                                               args.mqtt_port, 30)
             except OSError as e:
                 print(f"warning: mqtt broker {args.mqtt_broker}:{args.mqtt_port} "
-                      f"unavailable ({e}) — running without MQTT control",
-                      flush=True)
-                self.mqtt_client = None
-            else:
-                self.mqtt_client.loop_start()
+                      f"unavailable ({e}) — will keep retrying in the "
+                      "background", flush=True)
+            self.mqtt_client.loop_start()
 
         # Telegram (env-driven; silently off unless both vars present)
         self.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -312,9 +314,18 @@ class Notifier:
             self._warn_io(f"event log write failed: {e}")
 
     # -- mqtt ------------------------------------------------------------- #
+    def _check_mqtt_delivery(self, kind, info):
+        """Log (once, per failure) any MQTT publish that was not delivered."""
+        rc = getattr(info, "rc", 0)
+        if rc:
+            print(f"warning: mqtt {kind} publish not delivered (rc={rc})",
+                  flush=True)
+
     def mqtt_publish(self, payload):
         if self.mqtt_client:
-            self.mqtt_client.publish(self.args.mqtt_topic, json.dumps(payload))
+            info = self.mqtt_client.publish(self.args.mqtt_topic,
+                                            json.dumps(payload))
+            self._check_mqtt_delivery("event", info)
 
     # -- telegram --------------------------------------------------------- #
     def _telegram_url(self, method):
@@ -390,8 +401,9 @@ class Notifier:
 
     def publish_status(self, payload):
         if self.mqtt_client:
-            self.mqtt_client.publish(self.args.mqtt_status_topic,
-                                     json.dumps(payload), retain=True)
+            info = self.mqtt_client.publish(self.args.mqtt_status_topic,
+                                            json.dumps(payload), retain=True)
+            self._check_mqtt_delivery("status", info)
 
     # -- events ----------------------------------------------------------- #
     def fire_start(self, dets, ts, snapshot_path=None):
@@ -409,11 +421,13 @@ class Notifier:
         else:
             self.telegram_send_text(caption)
 
-    def fire_end(self, dets_last, ts, start_ts):
+    def fire_end(self, dets_last, ts, start_ts, reason=None):
         payload = {"type": "end", "ts": round(ts, 3),
                    "start": round(start_ts, 3),
                    "duration": round(ts - start_ts, 2),
                    "detections": dets_to_json(dets_last)}
+        if reason:
+            payload["reason"] = reason
         self.mqtt_publish(payload)
         self.log_line(payload)
         self.telegram_send_text(
@@ -473,6 +487,12 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if not args.stream and not args.image:
         sys.exit("give --stream <src> or --image <file>")
+
+    # install the graceful-stop handler before the (slow) model load and
+    # camera open so a systemd stop is never left without a clean path
+    import signal
+    signal.signal(signal.SIGTERM,
+                  lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
 
     labels = load_labels(args.labels)
     if labels:
@@ -649,10 +669,6 @@ def main(argv=None):
                     (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         return annotated
 
-    import signal
-    signal.signal(signal.SIGTERM,
-                  lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
-
     try:
         while True:
             ok, frame = cap.read()
@@ -661,6 +677,15 @@ def main(argv=None):
                 # stream hiccup / EOF: still close events gracefully, but
                 # back off instead of spinning at 100% CPU — and if it stays
                 # dead, exit so systemd (Restart=on-failure) brings it back.
+                if active and notify.armed:
+                    # camera died mid-event: log the end explicitly so a
+                    # stream failure is never mistaken for a genuine end
+                    active = False
+                    print(f"[{now:.3f}] EVENT END (stream lost) — lasted "
+                          f"{now - event_start_ts:.1f}s", flush=True)
+                    notify.fire_end([], now, event_start_ts,
+                                    reason="stream_lost")
+                    last_event_end = now
                 maybe_end(now)
                 stream_ok = False
                 stream_fails += 1

@@ -33,7 +33,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-_TOKEN_JS = "__DASH_TOKEN__"
+_TOKEN_JS = "__TOKEN_JS__"
 
 PAGE = """<!doctype html>
 <html lang="en">
@@ -263,7 +263,10 @@ def read_state(path):
         return None
     try:
         with open(path) as fh:
-            return json.load(fh)
+            obj = json.load(fh)
+            # a JSON list (e.g. a truncated/partially-flushed write) is not a
+            # valid state dict; skip it instead of crashing on .get()
+            return obj if isinstance(obj, dict) else None
     except (OSError, ValueError):
         return None
 
@@ -282,11 +285,15 @@ def make_handler(log_path, snapshot_dir, active_timeout, state_file=None,
             if not token:
                 return True
             t = qs.get("t", [""])[0]
-            if t and hmac.compare_digest(t, token):
+            # compare_digest is ASCII-only for str; encode both sides so a
+            # non-ASCII query value is rejected, not raised as an exception
+            if t and hmac.compare_digest(t.encode("utf-8"),
+                                         token.encode("utf-8")):
                 return True
             auth = self.headers.get("Authorization", "")
             if auth.startswith("Bearer "):
-                return hmac.compare_digest(auth[7:], token)
+                return hmac.compare_digest(auth[7:].encode("utf-8"),
+                                           token.encode("utf-8"))
             return False
 
         def _json(self, obj, code=200):

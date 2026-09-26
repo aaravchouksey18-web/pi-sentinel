@@ -2,16 +2,22 @@
 Description=pi-intrusion-detection web dashboard
 After=network-online.target pi-intrusion-detection.service
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 # CHANGE: the user that owns the project checkout (your Pi login)
 User=pi
 WorkingDirectory=%h/projects/pi-intrusion-detection
+EnvironmentFile=/etc/pi-intrusion.env
+# DASH_TOKEN is optional; when set the dashboard requires it on every
+# request (?t=<token> or Authorization: Bearer <token>).
 ExecStart=/usr/bin/python3 %h/projects/pi-intrusion-detection/dashboard.py \
     --log %h/projects/pi-intrusion-detection/events.jsonl \
     --snapshot-dir %h/snapshots \
-    --port 8001
+    --port 8001 \
+    --token ${DASH_TOKEN}
 Restart=on-failure
 RestartSec=5
 
