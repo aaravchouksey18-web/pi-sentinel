@@ -1,0 +1,22 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# models & heavy artifacts (see README for placement)
+*.tflite
+saved_model.pb
+research/
+tensorflow_models/
+
+# runtime output
+snapshots/
+annotated.jpg
+output.jpg
+
+# secrets / local config
+.env
+*.env
+
+# os
+.DS_Store

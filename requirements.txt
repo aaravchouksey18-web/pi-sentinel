@@ -1,0 +1,9 @@
+# core
+numpy
+opencv-python
+
+# TFLite interpreter (either works; tensorflow is the heavier option)
+tensorflow>=2.8
+
+# optional: MQTT alerts in headless mode
+paho-mqtt

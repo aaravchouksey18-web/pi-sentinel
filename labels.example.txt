@@ -1,0 +1,11 @@
+# One class name per line; the line number IS the class index (line 0 = class 0).
+#
+# Verified while testing this model: class index 2 fires on a person
+# (intrusion.jpg -> obj 0.60, class-conf 0.968). The other four classes are
+# placeholders — rename them to match your training set, or delete this file
+# if you only ever report raw class ids.
+class_0
+class_1
+person
+class_3
+class_4
