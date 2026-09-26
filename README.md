@@ -1,25 +1,36 @@
 # pi-intrusion-detection
 
 Intrusion detection on a Raspberry Pi: a YOLOv5 (TFLite) model watches a
-camera stream, flags people, and can run fully **headless** — publishing
-alerts over MQTT and saving annotated snapshots with no display attached.
+camera stream, flags people, and acts as an **event-driven sentry** — alerts
+fire only when a *new* intrusion starts and ends, not on every frame. Runs
+fully **headless** (MQTT alerts + annotated snapshots + JSONL event log), and
+ships a systemd unit so it can run as an always-on service.
 
-This is the consolidated, cleaned-up version of the project's original
-iterations (`testcode-v18/19/20.py`). One script, no hardcoded camera IPs,
-no secrets.
+Consolidated from the project's original iterations (`testcode-v18/19/20.py`)
+and spruced up: one script, no hardcoded camera IPs, no secrets in the repo.
 
 ```
 [ESP32-CAM / webcam] --MJPEG--> intrusion.py --YOLOv5 TFLite--> detections
                                                               |-- window (display mode)
-                                                              |-- MQTT alerts (headless)
-                                                              +-- annotated snapshots
+                                                              |-- MQTT events (headless)
+                                                              |-- Telegram alert + photo
+                                                              +-- snapshot / event log
 ```
+
+## How events work
+
+The watcher treats an intrusion as a **span**: while detections match the
+class filter, the event is `active`; once the frame is quiet for
+`--quiet-after` seconds the event `END`s; a new event can start only after
+`--event-cooldown` seconds, so re-entering or a person walking past doesn't
+spam alerts. MQTT, Telegram, snapshots, and the event log all fire on the
+START/END transitions, not on individual frames.
 
 ## Quick start
 
 1. **Get the model into place** (gitignored on purpose — it's a binary
-   artifact): copy your YOLOv5 TFLite export to this directory and name it
-   `best-fp16.tflite` (or pass `--model /path/to/model.tflite`).
+   artifact): copy your YOLOv5 TFLite export here as `best-fp16.tflite` (or
+   pass `--model /path/to/model.tflite`).
 
 2. **Self-test with a single image** (no camera needed):
 
@@ -34,17 +45,49 @@ no secrets.
    python3 intrusion.py --stream "http://<camera-ip>:81/stream"     # ESP32-CAM
    ```
 
-4. **Headless watcher with MQTT + snapshots:**
+4. **Headless sentry** — MQTT events + snapshots, no display:
 
    ```sh
    python3 intrusion.py --stream "http://<camera-ip>:81/stream" \
        --headless \
-       --mqtt-broker 127.0.0.1 --mqtt-topic intrusion/detections \
+       --mqtt-broker 127.0.0.1 --mqtt-topic intrusion/events \
        --snapshot-dir snapshots
    ```
 
-MQTT payloads are JSON: `{"ts": ..., "detections": [{"class_id": 2,
-"score": 0.97, "bbox": [x1, y1, x2, y2]}, ...]}` on each frame that has one.
+5. **Telegram alerts** (text + annotated photo on START, "all clear" on END):
+
+   ```sh
+   export TELEGRAM_BOT_TOKEN="<token from @BotFather>"
+   export TELEGRAM_CHAT_ID="<your chat id>"
+   python3 intrusion.py --stream "http://<camera-ip>:81/stream" --headless
+   ```
+
+## Run as a service (systemd)
+
+```sh
+sudo cp deploy/pi-intrusion-detection.service /etc/systemd/system/
+sudo cp deploy/pi-intrusion.env.example /etc/pi-intrusion.env
+sudo nano /etc/pi-intrusion.env        # fill tokens
+sudo nano /etc/systemd/system/pi-intrusion-detection.service   # set <CAMERA_URL>
+sudo systemctl daemon-reload
+sudo systemctl enable --now pi-intrusion-detection
+```
+
+Follow it with `journalctl -u pi-intrusion-detection -f`. The unit
+`EnvironmentFile`s the tokens, keeps them out of the repo, and restarts the
+watcher on failure.
+
+## MQTT payloads
+
+Topic: `intrusion/events` (default). JSON per event:
+
+```json
+{"type": "start", "ts": 1790421234.56, "detections": [
+   {"class_id": 2, "score": 0.97, "bbox": [12.0, 40.0, 200.0, 235.0]}],
+ "snapshot": "snapshots/20260926-150000.jpg"}
+{"type": "end", "ts": 1790421238.12, "start": 1790421234.56,
+ "duration": 3.56, "detections": []}
+```
 
 ## Options
 
@@ -57,8 +100,14 @@ MQTT payloads are JSON: `{"ts": ..., "detections": [{"class_id": 2,
 | `--stream` | — | video source: integer index or MJPEG/RTSP URL |
 | `--image` | — | single-shot mode: process one image file once |
 | `--headless` | off | never open a window |
-| `--snapshot-dir` | — | save annotated snapshots here |
-| `--mqtt-broker` | — | enable MQTT alerts (needs `paho-mqtt`) |
+| `--snapshot-dir` | — | save an annotated snapshot per intrusion START |
+| `--log` | `events.jsonl` | JSONL event log (append-only) |
+| `--quiet-after` | `2.0` | no-detection grace before an event ends (s) |
+| `--event-cooldown` | `30.0` | min seconds between separate events |
+| `--mqtt-broker` | — | enable MQTT events (needs `paho-mqtt`) |
+
+Telegram is configured exclusively through `TELEGRAM_BOT_TOKEN` /
+`TELEGRAM_CHAT_ID` env vars (see `deploy/pi-intrusion.env.example`).
 
 ## The model & class labels
 
@@ -78,14 +127,23 @@ pip install -r requirements.txt        # numpy, opencv-python, tensorflow, paho-
 
 `tensorflow` includes the TFLite interpreter; on a Pi you can substitute the
 lighter `tflite-runtime`. `paho-mqtt` is only needed when `--mqtt-broker` is
-used.
+used; Telegram uses only the Python standard library.
 
 ## Notes
 
-- **No personal data in this repo** — camera IPs are arguments, the Twilio
-  secrets from an earlier iteration were never carried over, and model
-  binaries/snapshots are gitignored.
+- **No personal data in this repo** — camera IPs are arguments, Telegram
+  tokens live in env/`EnvironmentFile`, the Twilio secrets from an earlier
+  iteration were never carried over, and model binaries/snapshots/event logs
+  are gitignored.
 - Detection boxes are drawn in the original frame coordinates (letterbox
   scaling is undone); the decode handles the YOLOv5 single-output format
   directly, no external detector libraries.
-- See `docs/build-log.md` for the consolidation history and model probes.
+- Stream hiccups are handled: if the source drops frames, the current event
+  still ends after `--quiet-after` instead of hanging.
+- Throughput on the Pi: this float fp16 model runs at roughly **0.5–1 fps**
+  on a Pi 4-class CPU (measured ≈1.9 s/frame with the TFLite XNNPACK
+  delegate, plus an ≈18 s cold model load). That's fine for an intrusion
+  watcher's START/END lifecycle. For higher rates, export an int8-quantized
+  YOLOv5 model — several times faster, same code.
+- See `docs/build-log.md` for the consolidation history, model probes, and
+  the spruce pass.

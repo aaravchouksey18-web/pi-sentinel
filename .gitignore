@@ -11,6 +11,7 @@ tensorflow_models/
 
 # runtime output
 snapshots/
+events.jsonl
 annotated.jpg
 output.jpg
 
