@@ -10,7 +10,7 @@ a small JSON API that the single-page UI polls every couple of seconds.
 
 Open http://<pi-ip>:8001 in a browser. Read-only by design — no POST
 endpoints and no secrets — but it DOES serve camera imagery, so a token
-(--token) is recommended whenever the dashboard is reachable beyond your
+(--token) is required whenever the dashboard is reachable beyond your
 own machines. Run it behind a reverse proxy if you want TLS.
 
 Status is derived from the log plus the sentry's state.json:
@@ -26,6 +26,7 @@ import argparse
 import glob
 import hmac
 import html
+import ipaddress
 import json
 import os
 import re
@@ -333,12 +334,20 @@ def make_handler(log_path, snapshot_dir, active_timeout, state_file=None,
                         stale = time.time() - float(state.get("ts", 0))
                     except (TypeError, ValueError):
                         stale = None
-                    if state.get("armed") is False:
+                    # OFFLINE first: a sentry that died mid-watch must
+                    # not keep showing a calm DISARMED/ARMED state.
+                    if stale is not None and stale > heartbeat_timeout:
+                        status, age = "OFFLINE", stale
+                    elif state.get("armed") is False:
                         status, age = "DISARMED", None
                     elif state.get("stream_ok") is False:
                         status, age = "STREAM-ERR", None
-                    elif stale is not None and stale > heartbeat_timeout:
-                        status, age = "OFFLINE", stale
+                    elif state.get("active") is True:
+                        # A fresh heartbeat that says the sentry is watching
+                        # right now means a long unresolved START is a
+                        # loitering intruder, not an orphaned event — keep it
+                        # ACTIVE (STALE is for a heartbeat that is stale too).
+                        status, age = "ACTIVE", 0.0
                 last_seen = None
                 if ev:
                     last_seen = ev[-1].get("ts", time.time())
@@ -398,7 +407,7 @@ def main(argv=None):
     p.add_argument("--log", default="events.jsonl")
     p.add_argument("--snapshot-dir", default=None)
     p.add_argument("--port", type=int, default=8001)
-    p.add_argument("--bind", default="0.0.0.0")
+    p.add_argument("--bind", default="127.0.0.1")
     p.add_argument("--allow-open", action="store_true",
                    help="serve with no token on a non-loopback bind "
                         "(exposes camera imagery to the LAN)")
@@ -413,10 +422,15 @@ def main(argv=None):
     p.add_argument("--state-file", default="state.json",
                    help="sentry state.json written by intrusion.py")
     args = p.parse_args(argv)
-    if not args.allow_open and not args.token and args.bind not in (
-            "127.0.0.1", "localhost", "::1"):
-        p.error("refusing to serve an open dashboard on a non-loopback "
-                "bind; set --token, bind 127.0.0.1, or pass --allow-open")
+    if not args.allow_open and not args.token:
+        try:
+            loopback = (ipaddress.ip_address(args.bind).version == 4
+                        and ipaddress.ip_address(args.bind).is_loopback)
+        except ValueError:
+            loopback = args.bind == "localhost"
+        if not loopback:
+            p.error("refusing to serve an open dashboard on a non-loopback "
+                    "bind; set --token, bind 127.0.0.1, or pass --allow-open")
     handler = make_handler(args.log, args.snapshot_dir, args.active_timeout,
                            args.state_file, token=args.token,
                            heartbeat_timeout=args.heartbeat_timeout)

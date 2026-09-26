@@ -36,6 +36,13 @@ import cv2
 import numpy as np
 
 
+# A retained arm/disarm published on the control topic is re-delivered on
+# every broker (re)connect and on every restart; commands arriving in the
+# first seconds after a connect are almost certainly that replay, so they
+# are ignored. The operator can always send a fresh command afterwards.
+CONTROL_RETAIN_GRACE_S = 5.0
+
+
 # --------------------------------------------------------------------------- #
 # image / decode helpers
 # --------------------------------------------------------------------------- #
@@ -270,6 +277,14 @@ class Notifier:
             else:                       # paho 1.x fallback (works the same)
                 self.mqtt_client = mqtt.Client()
 
+            if hasattr(self.mqtt_client, "max_queued_messages_set"):
+                # QoS-1 messages queue while the broker is unreachable; with
+                # no cap, a long outage queues thousands of retained heartbeat
+                # publishes and the shutdown heartbeat sits behind all of
+                # them. Successive heartbeats target the same retained topic,
+                # so the newest one is all that matters.
+                self.mqtt_client.max_queued_messages_set(2)
+
             def _on_connect(client, userdata, flags, *args):
                 # paho calls this on refused CONNACKs too (2.x hands a
                 # ReasonCode, 1.x an int) — say no before (re)subscribing
@@ -281,7 +296,8 @@ class Notifier:
                 # (re)subscribe here: paho's auto-reconnect does NOT restore
                 # subscriptions, so without this a broker restart would
                 # silently kill arm/disarm forever.
-                client.subscribe(self.args.mqtt_control_topic)
+                client.subscribe(self.args.mqtt_control_topic, qos=1)
+                self._connected_at = time.monotonic()
                 print(f"mqtt: connected; subscribed to "
                       f"{self.args.mqtt_control_topic}", flush=True)
 
@@ -411,6 +427,19 @@ class Notifier:
             action = "disarmed"
         else:
             action = None                       # "status" / "state" / "?"
+        if action and time.monotonic() - getattr(self, "_connected_at",
+                                                  -1e9) < CONTROL_RETAIN_GRACE_S:
+            # A retained arm/disarm is re-delivered on every (re)connect;
+            # applying it again lets a stale retained "disarm" disable the
+            # sentry forever. Ignore the replay — a fresh command works once
+            # the grace window has passed.
+            print(f"[control] ignored {action!r} within "
+                  f"{CONTROL_RETAIN_GRACE_S:g}s of (re)connect "
+                  f"(stale retained state)", flush=True)
+            self.last_command = {"cmd": cmd, "ts": round(now, 3),
+                                 "ignored": "stale retained replay"}
+            self.want_status = True
+            return
         self.last_command = {"cmd": cmd or "status", "ts": round(now, 3)}
         self.want_status = True
         if action:
@@ -674,11 +703,9 @@ def main(argv=None):
                 last_event_end = -999999.0
             else:
                 if active:
-                    # log the end explicitly so the dashboard doesn't stay ACTIVE
-                    notify.log_line({"type": "end", "ts": round(now, 3),
-                                     "start": round(event_start_ts, 3),
-                                     "duration": round(now - event_start_ts, 2),
-                                     "detections": [], "reason": "disarmed"})
+                    # close the event on every channel (JSONL + MQTT + Telegram)
+                    # so the dashboard doesn't stay ACTIVE after a disarm
+                    notify.fire_end([], now, event_start_ts, reason="disarmed")
                     print(f"[{now:.3f}] EVENT END (disarmed) — lasted "
                           f"{now - event_start_ts:.1f}s", flush=True)
                 print("[control] disarmed — events suppressed", flush=True)
@@ -774,7 +801,10 @@ def main(argv=None):
         if notify.mqtt_client:
             # drop the retained heartbeat so the dashboard shows OFFLINE —
             # wait briefly so the QoS-1 publish flushes before the loop stops
-            info = notify.publish_status({"online": False, "ts": time.time()})
+            st = sentry_state(time.time())
+            st["online"] = False
+            st["active"] = False
+            info = notify.publish_status(st)
             if info is not None:
                 try:
                     info.wait_for_publish(2)

@@ -68,7 +68,9 @@ Turned the single script into an event-driven sentry:
 - **Measured throughput** (worth planning around): cold model load ≈ 18 s,
   inference ≈ 1.9 s/frame (≈0.5 fps) with the float fp16 model via the
   XNNPACK delegate on this Pi. An int8-quantized export would restore
-  real-time review rates. Debugging note: earlier "END never fired" runs
+  real-time review rates (the TFLite runtime does the integer math
+  internally — nothing app-side dequantizes). Debugging note: earlier
+  "END never fired" runs
   turned out to be test-timing artifacts — the 55-frame test video needed
   ~100 s of frames but the runs were killed at 15–45 s, before the quiet
   segment was reached.

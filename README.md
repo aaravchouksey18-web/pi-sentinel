@@ -89,8 +89,9 @@ A tiny stdlib-only companion UI that reads the event log and serves the
 snapshots — no framework, no CDN, no secrets:
 
 ```sh
-python3 dashboard.py --log events.jsonl --snapshot-dir snapshots --port 8001
-# open http://<pi-ip>:8001
+python3 dashboard.py --log events.jsonl --snapshot-dir snapshots \
+    --bind 127.0.0.1 --port 8001
+# open http://<pi-ip>:8001 (default bind is loopback — expose via a proxy)
 ```
 
 Live status pill (**ARMED / ACTIVE / STALE / DISARMED / OFFLINE /
@@ -110,7 +111,7 @@ presence-vigil's :8000).
 |---|---|---|
 | `--log` | `events.jsonl` | event log to read |
 | `--snapshot-dir` | — | where the detector saves snapshots |
-| `--port` / `--bind` | `8001` / `0.0.0.0` | HTTP listen address (unit ships `127.0.0.1`) |
+| `--port` / `--bind` | `8001` / `127.0.0.1` | HTTP listen address (unit ships loopback + reverse proxy) |
 | `--allow-open` | — | no-token dashboard on a non-loopback bind (not recommended) |
 | `--token` | — | access token; every request needs `?t=<token>` or `Authorization: Bearer <token>` |
 | `--active-timeout` | `120` | an unresolved START older than this shows **STALE** (detector probably down) |
@@ -237,6 +238,8 @@ Telegram uses only the Python standard library.
   on a Pi 4-class CPU (measured ≈1.9 s/frame with the TFLite XNNPACK
   delegate, plus an ≈18 s cold model load). That's fine for an intrusion
   watcher's START/END lifecycle. For higher rates, export an int8-quantized
-  YOLOv5 model — several times faster, same code.
+  YOLOv5 model — several times faster; the TFLite runtime does the
+  quantized math internally (nothing on the app side dequantizes), so use
+  an export whose I/O tensors match what intrusion.py feeds the model.
 - See `docs/build-log.md` for the consolidation history, model probes, and
   the spruce pass.

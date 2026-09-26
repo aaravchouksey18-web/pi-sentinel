@@ -4,7 +4,9 @@
 # Adjust the path if you changed --log in the systemd unit (the shipped unit
 # runs intrusion.py with its default `events.jsonl` in WorkingDirectory, and
 # the dashboard reads `%h/projects/pi-intrusion-detection/events.jsonl`).
-%h/projects/pi-intrusion-detection/events.jsonl {
+# `%h` is systemd syntax; logrotate does not expand it, so use a glob
+# that matches the checkout under any user's home directory.
+/home/*/projects/pi-intrusion-detection/events.jsonl {
     daily
     rotate 7
     compress
