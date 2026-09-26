@@ -79,7 +79,9 @@ sudo systemctl enable --now pi-intrusion-detection
 Follow it with `journalctl -u pi-intrusion-detection -f`. The unit
 `EnvironmentFile`s the tokens (owned by root, chmod 600), keeps them out of
 the repo, and restarts the watcher on failure — including when the camera
-stalls for 30 consecutive reads (~6 s) so a dead stream self-heals.
+stalls for 30 consecutive failed reads (~6 s of instant failures, up to
+~2.5 min when reads block on the 5 s read timeout) so a dead stream
+self-heals.
 
 ## Web dashboard
 
@@ -97,9 +99,10 @@ auto-refreshes every 2.5 s. When run against the sentry's `state.json` it
 also shows its uptime, fps and last remote command, a **DISARMED** pill
 whenever the sentry has been told to go quiet, **STREAM-ERR** when the
 detector reports the camera is not producing frames, and **OFFLINE** when
-the heartbeat goes stale. Read-only by design. It serves camera imagery,
-so pass `--token` (or put a reverse proxy in front) whenever it's reachable
-beyond your own machines. Run it next to the detector; systemd unit:
+the heartbeat goes stale. Read-only by design. It serves camera imagery, so the shipped unit binds `127.0.0.1` — the
+dashboard only ever answers on the Pi itself, and `main()` refuses a
+non-loopback bind without a `--token` unless `--allow-open` is passed.
+Run it next to the detector; systemd unit:
 `deploy/pi-intrusion-dashboard.service` (port 8001, right next to
 presence-vigil's :8000).
 
@@ -107,7 +110,8 @@ presence-vigil's :8000).
 |---|---|---|
 | `--log` | `events.jsonl` | event log to read |
 | `--snapshot-dir` | — | where the detector saves snapshots |
-| `--port` / `--bind` | `8001` / `0.0.0.0` | HTTP listen address |
+| `--port` / `--bind` | `8001` / `0.0.0.0` | HTTP listen address (unit ships `127.0.0.1`) |
+| `--allow-open` | — | no-token dashboard on a non-loopback bind (not recommended) |
 | `--token` | — | access token; every request needs `?t=<token>` or `Authorization: Bearer <token>` |
 | `--active-timeout` | `120` | an unresolved START older than this shows **STALE** (detector probably down) |
 | `--heartbeat-timeout` | `20` | `state.json` older than this shows **OFFLINE** (sentry heartbeat runs every ~10 s) |
@@ -215,8 +219,12 @@ Telegram uses only the Python standard library.
   event with `"reason": "stream_lost"`, the loop backs off instead of
   spinning the CPU, `state.json` flips `stream_ok` to false (the dashboard
   briefly shows **STREAM-ERR**, then **OFFLINE** once the file goes stale),
-  and 30 consecutive failed reads (~6 s) exit so systemd restarts the
-  watcher.
+  and 30 consecutive failed reads (~6 s of instant failures, up to
+  ~2.5 min when reads block on the 5 s timeout) exit so systemd restarts
+  the watcher.
+- Snapshots older than `--snapshot-keep-days` (default 7) are pruned at
+  startup so a long-running sentry can't fill the SD card; rotate the
+  event log with the shipped `deploy/logrotate-pi-intrusion` stanza.
 - The detector publishes a **retained** heartbeat on `intrusion/status`
   (`online: true`) and flips it to `online: false` on graceful shutdown, so
   other MQTT consumers can watch for a dead sentry. The dashboard itself

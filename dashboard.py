@@ -262,7 +262,7 @@ def read_state(path):
     if not path:
         return None
     try:
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             obj = json.load(fh)
             # a JSON list (e.g. a truncated/partially-flushed write) is not a
             # valid state dict; skip it instead of crashing on .get()
@@ -273,7 +273,10 @@ def read_state(path):
 
 def make_handler(log_path, snapshot_dir, active_timeout, state_file=None,
                  token=None, heartbeat_timeout=20.0):
-    page = PAGE.replace(_TOKEN_JS, json.dumps(token or ""))
+    # "</" would close the <script> element: escape it so a token value
+    # cannot inject markup (page is token-gated, so this is self-XSS only)
+    page = PAGE.replace(_TOKEN_JS,
+                        json.dumps(token or "").replace("</", "<\\/"))
     class Handler(BaseHTTPRequestHandler):
         timeout = 10.0                      # no per-connection hangs
 
@@ -396,6 +399,9 @@ def main(argv=None):
     p.add_argument("--snapshot-dir", default=None)
     p.add_argument("--port", type=int, default=8001)
     p.add_argument("--bind", default="0.0.0.0")
+    p.add_argument("--allow-open", action="store_true",
+                   help="serve with no token on a non-loopback bind "
+                        "(exposes camera imagery to the LAN)")
     p.add_argument("--token", default=None,
                    help="optional access token; required as ?t=<token> or "
                         "Authorization: Bearer <token> on every request")
@@ -407,6 +413,10 @@ def main(argv=None):
     p.add_argument("--state-file", default="state.json",
                    help="sentry state.json written by intrusion.py")
     args = p.parse_args(argv)
+    if not args.allow_open and not args.token and args.bind not in (
+            "127.0.0.1", "localhost", "::1"):
+        p.error("refusing to serve an open dashboard on a non-loopback "
+                "bind; set --token, bind 127.0.0.1, or pass --allow-open")
     handler = make_handler(args.log, args.snapshot_dir, args.active_timeout,
                            args.state_file, token=args.token,
                            heartbeat_timeout=args.heartbeat_timeout)

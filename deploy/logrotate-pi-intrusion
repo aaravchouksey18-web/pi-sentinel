@@ -1,0 +1,15 @@
+# logrotate stanza for the pi-intrusion-detection event log.
+#
+# Install: sudo cp deploy/logrotate-pi-intrusion /etc/logrotate.d/pi-intrusion
+# Adjust the path if you changed --log in the systemd unit (the shipped unit
+# runs intrusion.py with its default `events.jsonl` in WorkingDirectory, and
+# the dashboard reads `%h/projects/pi-intrusion-detection/events.jsonl`).
+%h/projects/pi-intrusion-detection/events.jsonl {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

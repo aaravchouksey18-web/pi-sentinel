@@ -5,10 +5,12 @@ port and checks the security/token paths that used to be untested."""
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 from threading import Thread
@@ -101,6 +103,43 @@ class NoTokenDashboardTest(DashboardServeMixin, unittest.TestCase):
         status, body = self.get("/")
         self.assertEqual(status, 200)
         self.assertNotIn(b"__TOKEN_JS__", body)
+
+
+class TokenEscapeTest(DashboardServeMixin, unittest.TestCase):
+    token = 'x</script><script>alert(1)</script>y'
+
+    def test_token_cannot_close_the_script_element(self):
+        status, body = self.get("/", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"TOKEN = \"x</", body)   # raw closer would be parseable
+        self.assertNotIn(b"</script><script>", body)
+
+
+class BindSafetyTest(unittest.TestCase):
+    def test_open_nonloopback_bind_refused(self):
+        root = os.path.join(os.path.dirname(__file__), "..")
+        out = subprocess.run(
+            [sys.executable, "-m", "dashboard", "--token", "",
+             "--bind", "0.0.0.0"],
+            cwd=root, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("refusing", out.stderr)
+
+    def test_loopback_without_token_starts(self):
+        # a loopback no-token bind is legal: main() must reach serve_forever()
+        # and stay up (killed here) — not refuse like the non-loopback case
+        root = os.path.join(os.path.dirname(__file__), "..")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "dashboard", "--token", "",
+             "--bind", "127.0.0.1", "--port", "0"],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+        try:
+            _out, err = proc.communicate(timeout=3)
+            self.fail(f"loopback no-token bind refused by main(): {err}")
+        except subprocess.TimeoutExpired:
+            proc.kill()   # still listening after 3 s == legal bind accepted
+        proc.wait()
 
 
 class ReadStateTest(unittest.TestCase):

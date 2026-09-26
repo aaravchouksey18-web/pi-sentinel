@@ -218,8 +218,12 @@ def load_interpreter(model_path):
 class Detector:
     def __init__(self, model_path, threshold=0.5, labels=None, wanted=None):
         self.interp, self.inp, self.out = load_interpreter(model_path)
+        shape = list(self.inp["shape"])
+        if len(shape) != 4 or shape[1] != shape[2] or shape[1] <= 0:
+            sys.exit(f"model input must be [1, H, W, C] with square H == W; "
+                     f"got {shape} — re-export with a square input")
         # keep input size tied to what the model actually declares
-        self.input_size = int(self.inp["shape"][1])
+        self.input_size = int(shape[1])
         self.threshold = threshold
         self.labels = labels
         self.wanted = wanted
@@ -267,6 +271,13 @@ class Notifier:
                 self.mqtt_client = mqtt.Client()
 
             def _on_connect(client, userdata, flags, *args):
+                # paho calls this on refused CONNACKs too (2.x hands a
+                # ReasonCode, 1.x an int) — say no before (re)subscribing
+                rc = args[0] if args else 0
+                if getattr(rc, "is_failure", rc != 0):
+                    print(f"mqtt: connect refused (rc={rc}); not subscribed",
+                          flush=True)
+                    return
                 # (re)subscribe here: paho's auto-reconnect does NOT restore
                 # subscriptions, so without this a broker restart would
                 # silently kill arm/disarm forever.
@@ -276,17 +287,19 @@ class Notifier:
 
             self.mqtt_client.on_connect = _on_connect
             self.mqtt_client.on_message = self._on_control
-            self.mqtt_client.max_queued_messages_set(100)
             # connect_async + loop_start: paho keeps retrying in the
             # background until the broker appears, so a broker down at
-            # startup cannot permanently disable MQTT control.
-            try:
-                self.mqtt_client.connect_async(args.mqtt_broker,
-                                               args.mqtt_port, 30)
-            except OSError as e:
-                print(f"warning: mqtt broker {args.mqtt_broker}:{args.mqtt_port} "
-                      f"unavailable ({e}) — will keep retrying in the "
-                      "background", flush=True)
+            # startup cannot permanently disable MQTT control. QoS>0
+            # publishes (the retained heartbeat) queue while offline and
+            # flush on reconnect; QoS-0 event publishes are dropped while
+            # offline — they are also JSONL + Telegram.
+            self.mqtt_client.on_connect_fail = \
+                lambda *_: print("mqtt: broker unavailable — retrying in the "
+                                 "background", flush=True)
+            if hasattr(self.mqtt_client, "suppress_exceptions"):
+                self.mqtt_client.suppress_exceptions = True
+            self.mqtt_client.connect_async(args.mqtt_broker,
+                                           args.mqtt_port, 30)
             self.mqtt_client.loop_start()
 
         # Telegram (env-driven; silently off unless both vars present)
@@ -315,17 +328,21 @@ class Notifier:
 
     # -- mqtt ------------------------------------------------------------- #
     def _check_mqtt_delivery(self, kind, info):
-        """Log (once, per failure) any MQTT publish that was not delivered."""
+        """Log (at most every 30 s) any MQTT publish not delivered."""
         rc = getattr(info, "rc", 0)
         if rc:
-            print(f"warning: mqtt {kind} publish not delivered (rc={rc})",
-                  flush=True)
+            self._warn_io(f"mqtt {kind} publish not delivered (rc={rc})")
 
     def mqtt_publish(self, payload):
-        if self.mqtt_client:
+        if not self.mqtt_client:
+            return
+        try:
             info = self.mqtt_client.publish(self.args.mqtt_topic,
                                             json.dumps(payload))
-            self._check_mqtt_delivery("event", info)
+        except Exception as e:
+            self._warn_io(f"mqtt event publish failed: {e}")
+            return
+        self._check_mqtt_delivery("event", info)
 
     # -- telegram --------------------------------------------------------- #
     def _telegram_url(self, method):
@@ -400,18 +417,25 @@ class Notifier:
             print(f"[control] {action} ({msg.topic})", flush=True)
 
     def publish_status(self, payload):
-        if self.mqtt_client:
+        if not self.mqtt_client:
+            return None
+        try:
             info = self.mqtt_client.publish(self.args.mqtt_status_topic,
-                                            json.dumps(payload), retain=True)
-            self._check_mqtt_delivery("status", info)
+                                            json.dumps(payload), retain=True,
+                                            qos=1)
+        except Exception as e:
+            self._warn_io(f"mqtt status publish failed: {e}")
+            return None
+        self._check_mqtt_delivery("status", info)
+        return info
 
     # -- events ----------------------------------------------------------- #
     def fire_start(self, dets, ts, snapshot_path=None):
         payload = {"type": "start", "ts": round(ts, 3),
                    "detections": dets_to_json(dets),
                    "snapshot": snapshot_path}
+        self.log_line(payload)          # write the record before MQTT
         self.mqtt_publish(payload)
-        self.log_line(payload)
         names = ", ".join(f"{class_name(d, self.labels)} {d['score']:.2f}"
                           for d in dets)
         caption = (f"🚨 Intrusion detected ({len(dets)}): {names}\n"
@@ -428,8 +452,8 @@ class Notifier:
                    "detections": dets_to_json(dets_last)}
         if reason:
             payload["reason"] = reason
+        self.log_line(payload)          # write the record before MQTT
         self.mqtt_publish(payload)
-        self.log_line(payload)
         self.telegram_send_text(
             f"✅ All clear — alarm lasted {ts - start_ts:.1f}s")
 
@@ -437,6 +461,30 @@ class Notifier:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+
+def prune_old_snapshots(snapshot_dir, keep_days):
+    """Delete snapshot JPEGs not touched in the last keep_days, once at startup
+    so a long-running sentry can't fill the SD card."""
+    if keep_days <= 0:
+        return 0
+    cutoff = time.time() - keep_days * 86400
+    removed = 0
+    try:
+        names = os.listdir(snapshot_dir)
+    except OSError:
+        return 0
+    for name in names:
+        path = os.path.join(snapshot_dir, name)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        print(f"pruned {removed} snapshot(s) older than {keep_days}d", flush=True)
+    return removed
+
 
 def build_parser():
     p = argparse.ArgumentParser(
@@ -461,6 +509,8 @@ def build_parser():
                    action="store_true", help="never open a window")
     p.add_argument("--snapshot-dir", default=None,
                    help="save an annotated snapshot per intrusion event")
+    p.add_argument("--snapshot-keep-days", type=int, default=7,
+                   help="prune snapshots older than this at startup (0 = keep all)")
     p.add_argument("--log", default="events.jsonl",
                    help="JSONL event log (default events.jsonl)")
     p.add_argument("--quiet-after", type=float, default=6.0,
@@ -514,6 +564,7 @@ def main(argv=None):
             os.makedirs(args.snapshot_dir, exist_ok=True)
         except OSError as e:
             sys.exit(f"cannot create snapshot dir {args.snapshot_dir}: {e}")
+        prune_old_snapshots(args.snapshot_dir, args.snapshot_keep_days)
 
     # ------------------------------------------------------------------ #
     # single image mode
@@ -548,7 +599,10 @@ def main(argv=None):
     if not cap.isOpened():
         sys.exit(f"cannot open stream: {src}")
     # don't hang forever inside cap.read() when the stream stalls
-    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+    if not cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000):
+        print("warning: stream read timeout unsupported — a hung stream can "
+              "block read() indefinitely (systemd Restart=on-failure is the "
+              "only backstop)", flush=True)
     print(f"watching {src} (Ctrl+C to stop)")
 
     boot_ts = time.time()
@@ -644,7 +698,9 @@ def main(argv=None):
                     if args.snapshot_dir:
                         # ms resolution so two starts in the same second
                         # can't silently overwrite each other
-                        millis = int(round((now - int(now)) * 1000))
+                        # int() truncates; round() of 999.6 -> 1000 would
+                        # break the dashboard's 3-digit filename regex
+                        millis = int((now - int(now)) * 1000) % 1000
                         snap = os.path.join(
                             args.snapshot_dir,
                             time.strftime("%Y%m%d-%H%M%S") + f"-{millis:03d}.jpg")
@@ -686,7 +742,6 @@ def main(argv=None):
                     notify.fire_end([], now, event_start_ts,
                                     reason="stream_lost")
                     last_event_end = now
-                maybe_end(now)
                 stream_ok = False
                 stream_fails += 1
                 if stream_fails == 1:
@@ -717,8 +772,14 @@ def main(argv=None):
         if not args.headless:
             cv2.destroyAllWindows()
         if notify.mqtt_client:
-            # drop the retained heartbeat so the dashboard shows OFFLINE
-            notify.publish_status({"online": False, "ts": time.time()})
+            # drop the retained heartbeat so the dashboard shows OFFLINE —
+            # wait briefly so the QoS-1 publish flushes before the loop stops
+            info = notify.publish_status({"online": False, "ts": time.time()})
+            if info is not None:
+                try:
+                    info.wait_for_publish(2)
+                except Exception:
+                    pass
             notify.mqtt_client.loop_stop()
 
 

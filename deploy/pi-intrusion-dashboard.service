@@ -10,12 +10,16 @@ Type=simple
 # CHANGE: the user that owns the project checkout (your Pi login)
 User=pi
 WorkingDirectory=%h/projects/pi-intrusion-detection
-EnvironmentFile=/etc/pi-intrusion.env
+# `-` prefix: the env file itself is optional (only its DASH_TOKEN value
+# gates access when present). Defaults to loopback so camera imagery can
+# never leak to the LAN even with an empty DASH_TOKEN.
+EnvironmentFile=-/etc/pi-intrusion.env
 # DASH_TOKEN is optional; when set the dashboard requires it on every
 # request (?t=<token> or Authorization: Bearer <token>).
 ExecStart=/usr/bin/python3 %h/projects/pi-intrusion-detection/dashboard.py \
     --log %h/projects/pi-intrusion-detection/events.jsonl \
     --snapshot-dir %h/snapshots \
+    --bind 127.0.0.1 \
     --port 8001 \
     --token ${DASH_TOKEN}
 Restart=on-failure

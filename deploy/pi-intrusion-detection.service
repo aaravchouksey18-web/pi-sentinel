@@ -19,8 +19,9 @@ ExecStart=/usr/bin/python3 %h/projects/pi-intrusion-detection/intrusion.py \
     --mqtt-broker 127.0.0.1 \
     --mqtt-topic intrusion/events \
     --snapshot-dir %h/snapshots
-# Telegram tokens etc. live here, outside the repo (see pi-intrusion.env.example)
-EnvironmentFile=/etc/pi-intrusion.env
+# Telegram tokens etc. live here, outside the repo (see pi-intrusion.env.example);
+# the `-` prefix makes the file itself optional, not just its values.
+EnvironmentFile=-/etc/pi-intrusion.env
 Restart=on-failure
 RestartSec=5
 
