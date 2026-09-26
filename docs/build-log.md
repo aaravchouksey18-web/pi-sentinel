@@ -72,3 +72,17 @@ Turned the single script into an event-driven sentry:
   turned out to be test-timing artifacts — the 55-frame test video needed
   ~100 s of frames but the runs were killed at 15–45 s, before the quiet
   segment was reached.
+
+## Dashboard pass — 2026-09-26
+
+- **`dashboard.py`** — a stdlib-only web UI for the sentry. It reads the
+  JSONL event log (no DB), serves the annotated snapshots, and derives a
+  live ARM state (ARMED activate / ACTIVE when a START is unresolved /
+  STALE beyond `--active-timeout`). Single-page HTML with inline CSS/JS
+  polling `/api/events` every 2.5 s — no framework, no CDN, read-only, no
+  secrets. Designed to sit next to presence-vigil's :8000 on :8001.
+- `deploy/pi-intrusion-dashboard.service` — systemd unit for the dashboard.
+- Verified on the Pi: served the page, `/api/events`, `/healthz`, and a
+  snapshot JPEG; status transitions checked against the log tail
+  (empty log → ARMED, unresolved start → ACTIVE, stale start → STALE,
+  appended end → ARMED with history).

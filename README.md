@@ -14,7 +14,8 @@ and spruced up: one script, no hardcoded camera IPs, no secrets in the repo.
                                                               |-- window (display mode)
                                                               |-- MQTT events (headless)
                                                               |-- Telegram alert + photo
-                                                              +-- snapshot / event log
+                                                              |-- snapshot / event log
+                                                              +-- dashboard.py web UI (:8001)
 ```
 
 ## How events work
@@ -76,6 +77,29 @@ sudo systemctl enable --now pi-intrusion-detection
 Follow it with `journalctl -u pi-intrusion-detection -f`. The unit
 `EnvironmentFile`s the tokens, keeps them out of the repo, and restarts the
 watcher on failure.
+
+## Web dashboard
+
+A tiny stdlib-only companion UI that reads the event log and serves the
+snapshots — no framework, no CDN, no secrets:
+
+```sh
+python3 dashboard.py --log events.jsonl --snapshot-dir snapshots --port 8001
+# open http://<pi-ip>:8001
+```
+
+Live status pill (**ARMED / ACTIVE / STALE**), last event, a snapshot
+grid, and recent history — auto-refreshes every 2.5 s. Read-only by
+design. Run it next to the detector; systemd unit:
+`deploy/pi-intrusion-dashboard.service` (port 8001, right next to
+presence-vigil's :8000).
+
+| flag | default | meaning |
+|---|---|---|
+| `--log` | `events.jsonl` | event log to read |
+| `--snapshot-dir` | — | where the detector saves snapshots |
+| `--port` / `--bind` | `8001` / `0.0.0.0` | HTTP listen address |
+| `--active-timeout` | `120` | an unresolved START older than this shows **STALE** (detector probably down) |
 
 ## MQTT payloads
 
