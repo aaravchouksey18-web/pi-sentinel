@@ -28,19 +28,13 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 
 import cv2
 import numpy as np
-
-
-# A retained arm/disarm published on the control topic is re-delivered on
-# every broker (re)connect and on every restart; commands arriving in the
-# first seconds after a connect are almost certainly that replay, so they
-# are ignored. The operator can always send a fresh command afterwards.
-CONTROL_RETAIN_GRACE_S = 5.0
 
 
 # --------------------------------------------------------------------------- #
@@ -229,6 +223,11 @@ class Detector:
         if len(shape) != 4 or shape[1] != shape[2] or shape[1] <= 0:
             sys.exit(f"model input must be [1, H, W, C] with square H == W; "
                      f"got {shape} — re-export with a square input")
+        if self.inp.get("dtype") != np.float32:
+            sys.exit(f"model input dtype must be float32 (got "
+                     f"{self.inp.get('dtype')}); set_tensor requires an exact "
+                     f"dtype match, and int8/uint8 quantized exports are not "
+                     f"supported by this build — re-export float16/fp32")
         # keep input size tied to what the model actually declares
         self.input_size = int(shape[1])
         self.threshold = threshold
@@ -297,7 +296,6 @@ class Notifier:
                 # subscriptions, so without this a broker restart would
                 # silently kill arm/disarm forever.
                 client.subscribe(self.args.mqtt_control_topic, qos=1)
-                self._connected_at = time.monotonic()
                 print(f"mqtt: connected; subscribed to "
                       f"{self.args.mqtt_control_topic}", flush=True)
 
@@ -314,6 +312,14 @@ class Notifier:
                                  "background", flush=True)
             if hasattr(self.mqtt_client, "suppress_exceptions"):
                 self.mqtt_client.suppress_exceptions = True
+            # LWT: if the process dies hard (kill -9, power cut) the broker
+            # drops this retained OFFLINE heartbeat itself, so the dashboard
+            # can never show a calm ARMED sentry that is actually gone.
+            self.mqtt_client.will_set(
+                args.mqtt_status_topic,
+                json.dumps({"online": False,
+                            "ts": round(time.time(), 3)}),
+                qos=1, retain=True)
             self.mqtt_client.connect_async(args.mqtt_broker,
                                            args.mqtt_port, 30)
             self.mqtt_client.loop_start()
@@ -343,10 +349,16 @@ class Notifier:
             self._warn_io(f"event log write failed: {e}")
 
     # -- mqtt ------------------------------------------------------------- #
-    def _check_mqtt_delivery(self, kind, info):
-        """Log (at most every 30 s) any MQTT publish not delivered."""
+    def _check_mqtt_delivery(self, kind, info, qos=0):
+        """Log (at most every 30 s) publishes that actually drop data.
+
+        rc == MQTT_ERR_NO_CONN (4) with qos>0 means paho QUEUED the message
+        and will flush it on reconnect — that is queued, not lost. QoS-0
+        publishes are dropped while offline, and a full queue
+        (MQTT_ERR_QUEUE_SIZE = 15) drops qos>0 messages; surface both.
+        """
         rc = getattr(info, "rc", 0)
-        if rc:
+        if rc and (qos == 0 or rc == 15):
             self._warn_io(f"mqtt {kind} publish not delivered (rc={rc})")
 
     def mqtt_publish(self, payload):
@@ -365,6 +377,20 @@ class Notifier:
         return (f"https://api.telegram.org/bot{self.telegram_token}/{method}")
 
     def telegram_send_photo(self, caption, photo_path):
+        """Send the photo alert on a daemon thread.
+
+        Telegram can hang for the full urlopen timeout (20 s per call, and
+        sendPhoto falls back to sendText on failure = up to 40 s). Running
+        it on the side keeps a blackholed endpoint from stalling the
+        detection loop — during a stall no frames are watched and
+        state.json goes stale.
+        """
+        if not (self.telegram_token and self.telegram_chat):
+            return
+        threading.Thread(target=self._telegram_send_photo,
+                         args=(caption, photo_path), daemon=True).start()
+
+    def _telegram_send_photo(self, caption, photo_path):
         """Multipart sendPhoto (stdlib urllib, no deps)."""
         if not (self.telegram_token and self.telegram_chat):
             return
@@ -414,36 +440,38 @@ class Notifier:
         raw = msg.payload.decode(errors="replace").strip()
         try:
             data = json.loads(raw)
-            cmd = (str(data.get("command") or data.get("cmd") or "").lower()
-                   if isinstance(data, dict) else str(data).lower())
+            cmd = (str(data.get("command") or data.get("cmd") or "").strip()
+                   .lower() if isinstance(data, dict) else str(data).strip()
+                   .lower())
         except ValueError:
             cmd = raw.lower()
-        now = time.time()
         if cmd in ("arm", "on", "enable", "resume"):
-            self.armed = True
             action = "armed"
         elif cmd in ("disarm", "off", "disable", "pause"):
-            self.armed = False
             action = "disarmed"
         else:
             action = None                       # "status" / "state" / "?"
-        if action and time.monotonic() - getattr(self, "_connected_at",
-                                                  -1e9) < CONTROL_RETAIN_GRACE_S:
-            # A retained arm/disarm is re-delivered on every (re)connect;
-            # applying it again lets a stale retained "disarm" disable the
-            # sentry forever. Ignore the replay — a fresh command works once
-            # the grace window has passed.
-            print(f"[control] ignored {action!r} within "
-                  f"{CONTROL_RETAIN_GRACE_S:g}s of (re)connect "
-                  f"(stale retained state)", flush=True)
-            self.last_command = {"cmd": cmd, "ts": round(now, 3),
-                                 "ignored": "stale retained replay"}
+        if action and getattr(msg, "retain", 0):
+            # A retained arm/disarm on the control topic is re-delivered on
+            # every broker (re)connect and on every restart; applying it
+            # again lets a stale retained "disarm" disable the sentry for
+            # ever. Retained control messages are always the old state, so
+            # ignore them outright — send live commands with retain off.
+            print(f"[control] ignored {action!r}: retained replay (stale "
+                  f"control state on the broker)", flush=True)
+            self.last_command = {"cmd": cmd, "ts": round(time.time(), 3),
+                                 "ignored": "retained replay"}
             self.want_status = True
             return
+        now = time.time()
+        if action:
+            if action == "armed":
+                self.armed = True
+            else:
+                self.armed = False
+            print(f"[control] {action} ({msg.topic})", flush=True)
         self.last_command = {"cmd": cmd or "status", "ts": round(now, 3)}
         self.want_status = True
-        if action:
-            print(f"[control] {action} ({msg.topic})", flush=True)
 
     def publish_status(self, payload):
         if not self.mqtt_client:
@@ -455,7 +483,7 @@ class Notifier:
         except Exception as e:
             self._warn_io(f"mqtt status publish failed: {e}")
             return None
-        self._check_mqtt_delivery("status", info)
+        self._check_mqtt_delivery("status", info, qos=1)
         return info
 
     # -- events ----------------------------------------------------------- #
@@ -670,13 +698,14 @@ def main(argv=None):
             "last_command": notify.last_command,
         }
 
-    def write_state_atomic(now):
+    def write_state_atomic(now, payload=None):
         if not args.state_file:
             return
         tmp = args.state_file + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(sentry_state(now), fh)
+                json.dump(sentry_state(now) if payload is None else payload,
+                          fh)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, args.state_file)
@@ -800,10 +829,16 @@ def main(argv=None):
             cv2.destroyAllWindows()
         if notify.mqtt_client:
             # drop the retained heartbeat so the dashboard shows OFFLINE —
-            # wait briefly so the QoS-1 publish flushes before the loop stops
+            # wait briefly so the QoS-1 publish flushes before the loop stops.
             st = sentry_state(time.time())
             st["online"] = False
             st["active"] = False
+            write_state_atomic(time.time(), st)   # state.json too, not only MQTT
+            # the 2-message cap (pass-4) can drop this exact heartbeat when
+            # the broker was down and the queue is already full — lift it so
+            # the OFFLINE announcement is what actually lands.
+            if hasattr(notify.mqtt_client, "max_queued_messages_set"):
+                notify.mqtt_client.max_queued_messages_set(0)
             info = notify.publish_status(st)
             if info is not None:
                 try:

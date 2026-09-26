@@ -13,5 +13,9 @@
     delaycompress
     missingok
     notifempty
-    copytruncate
+    # rename rotation instead of copytruncate: the detector reopens the log
+    # per line, so a rename cycle loses nothing, and the fresh file is
+    # owned by pi (create) so writes keep succeeding.
+    su pi pi
+    create 0640 pi pi
 }

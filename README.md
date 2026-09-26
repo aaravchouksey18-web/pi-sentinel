@@ -148,6 +148,12 @@ drawing; re-arming starts a fresh watch immediately. The subscription is
 re-established on every MQTT connect via an `on_connect` handler, so a
 broker restart (or WiFi blip) can never silently kill remote control.
 
+> **Retained control messages are ignored.** A retained `arm`/`disarm` on
+> `intrusion/control` is re-delivered on every re-connect and on every
+> restart, so applying it again would let a stale retained `disarm` disable
+> the sentry forever. Publish live commands with `retain` off (the default)
+> — or clear the retained message once you want to re-arm.
+
 Every `--status-interval` seconds it publishes a **retained** heartbeat to
 `intrusion/status` and writes `state.json` (gitignored) so the dashboard
 shows the true sentry state — including a **DISARMED** pill — instead of

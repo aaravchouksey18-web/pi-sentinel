@@ -152,7 +152,9 @@ async function tick() {
       stt ? stt.fps + " fps" : "—";
     const lc = stt && stt.last_command;
     document.getElementById("cmd").textContent =
-      lc ? lc.cmd + " · " + new Date(lc.ts * 1000).toLocaleTimeString() : "—";
+      lc ? (lc.cmd +
+        (lc.ignored ? " (ignored: " + lc.ignored + ")" : "") +
+        " · " + new Date(lc.ts * 1000).toLocaleTimeString()) : "—";
     const lsev = document.getElementById("lastsev");
     if (d.last) {
       const e = d.last;
@@ -334,9 +336,13 @@ def make_handler(log_path, snapshot_dir, active_timeout, state_file=None,
                         stale = time.time() - float(state.get("ts", 0))
                     except (TypeError, ValueError):
                         stale = None
-                    # OFFLINE first: a sentry that died mid-watch must
-                    # not keep showing a calm DISARMED/ARMED state.
-                    if stale is not None and stale > heartbeat_timeout:
+                    # OFFLINE first: a sentry that died mid-watch (stale heartbeats, or a
+                    # graceful shutdown that wrote online:false to
+                    # state.json) must not keep showing a calm
+                    # DISARMED/ARMED state.
+                    if state.get("online") is False:
+                        status, age = "OFFLINE", 0.0
+                    elif stale is not None and stale > heartbeat_timeout:
                         status, age = "OFFLINE", stale
                     elif state.get("armed") is False:
                         status, age = "DISARMED", None
@@ -411,9 +417,10 @@ def main(argv=None):
     p.add_argument("--allow-open", action="store_true",
                    help="serve with no token on a non-loopback bind "
                         "(exposes camera imagery to the LAN)")
-    p.add_argument("--token", default=None,
+    p.add_argument("--token", default=os.environ.get("DASH_TOKEN"),
                    help="optional access token; required as ?t=<token> or "
-                        "Authorization: Bearer <token> on every request")
+                        "Authorization: Bearer <token> on every request "
+                        "('--token' overrides the DASH_TOKEN env var)")
     p.add_argument("--active-timeout", type=float, default=120.0,
                    help="seconds before an unresolved START is STALE")
     p.add_argument("--heartbeat-timeout", type=float, default=20.0,

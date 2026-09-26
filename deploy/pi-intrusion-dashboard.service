@@ -16,12 +16,12 @@ WorkingDirectory=%h/projects/pi-intrusion-detection
 EnvironmentFile=-/etc/pi-intrusion.env
 # DASH_TOKEN is optional; when set the dashboard requires it on every
 # request (?t=<token> or Authorization: Bearer <token>).
+# DASH_TOKEN is read from the env file by dashboard.py itself.
 ExecStart=/usr/bin/python3 %h/projects/pi-intrusion-detection/dashboard.py \
     --log %h/projects/pi-intrusion-detection/events.jsonl \
     --snapshot-dir %h/snapshots \
     --bind 127.0.0.1 \
-    --port 8001 \
-    --token ${DASH_TOKEN}
+    --port 8001
 Restart=on-failure
 RestartSec=5
 
