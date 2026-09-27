@@ -24,6 +24,7 @@ Status is derived from the log plus the sentry's state.json:
 
 import argparse
 import glob
+import gzip
 import hmac
 import html
 import ipaddress
@@ -196,17 +197,16 @@ setInterval(ck, 1000); ck();
 _SNAP_RE = re.compile(r"\d{8}-\d{6}(?:-\d{3})?\.jpg")
 
 
-def read_events(path, limit=300, tail_bytes=1 << 20):
-    """Return the last `limit` events, reading only the file tail.
-
-    Earlier versions parsed the whole log per request (and per poll); the
-    tail read keeps both memory and CPU bounded no matter how big the log
-    grows. Non-JSON and non-object lines are skipped.
-    """
+def _read_tail(path, tail_bytes):
+    """Parse JSONL lines from the TAIL of one (possibly .gz) file."""
     out = []
     try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as fh:
+        if path.endswith(".gz"):
+            open_file = gzip.open(path, "rb")
+        else:
+            open_file = open(path, "rb")
+        with open_file as fh:
+            size = os.path.getsize(path)
             if size > tail_bytes:
                 fh.seek(size - tail_bytes)
                 fh.readline()                # drop the partial first line
@@ -222,13 +222,51 @@ def read_events(path, limit=300, tail_bytes=1 << 20):
                     continue
     except OSError:
         pass
-    return out[-limit:]
+    return out
+
+
+def read_events(path, limit=300, tail_bytes=1 << 20, max_rotations=8):
+    """Return the last `limit` events across the log + its logrotate chain.
+
+    The shipped logrotate stanza renames events.jsonl to .1/.2(/.gz) daily;
+    reading only the live file used to reset the dashboard's history table
+    and "last event" card to nothing at every midnight rotation. Files are
+    scanned newest-first and work stops as soon as `limit` events are found,
+    so a poll never parses more than ~`limit` + `tail_bytes` of lines no
+    matter how long the chain is. .gz entries appear after `delaycompress`.
+    """
+    chain = []
+    if path:
+        chain.append(path)
+        for i in range(1, max_rotations + 1):
+            p = f"{path}.{i}"
+            if os.path.exists(p):
+                chain.append(p)
+                continue
+            pgz = p + ".gz"
+            if os.path.exists(pgz):
+                chain.append(pgz)
+                continue
+            break
+    parts = [ev for ev in (_read_tail(p, tail_bytes) for p in chain) if ev]
+    merged = []
+    for evs in reversed(parts):      # oldest file -> newest file
+        merged.extend(evs)
+    return merged[-limit:]
 
 
 def derive_status(events, active_timeout):
     """ARMED / ACTIVE / (STALE, age) from the tail of the log."""
     for e in reversed(events):
         t = e.get("type")
+        if t == "boot":
+            # A boot record means the sentry restarted — a crash / power
+            # loss usually leaves no END for the OLD process's open START.
+            # Scanning past the boot used to resurrect that orphaned event
+            # and pin the pill to STALE/ACTIVE for hours after a perfectly
+            # healthy restart; the fresh process's own heartbeat (state.json)
+            # is the source of truth after a reboot, so stop here.
+            break
         if t == "start":
             try:
                 age = time.time() - float(e.get("ts", 0))
@@ -302,6 +340,16 @@ def make_handler(log_path, snapshot_dir, active_timeout, state_file=None,
                                            token.encode("utf-8"))
             return False
 
+        def _write_body(self, body):
+            # A client that disappears mid-response (tab close, curl | head,
+            # reverse-proxy timeout) raises BrokenPipeError on this socket —
+            # silently close instead of letting it escape into the journal,
+            # where it used to dump a full traceback per dropped poll.
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+
         def _json(self, obj, code=200):
             body = json.dumps(obj).encode()
             self.send_response(code)
@@ -309,7 +357,7 @@ def make_handler(log_path, snapshot_dir, active_timeout, state_file=None,
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self._write_body(body)
 
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -325,7 +373,7 @@ def make_handler(log_path, snapshot_dir, active_timeout, state_file=None,
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                self._write_body(body)
                 return
             if path == "/api/events":
                 ev = read_events(log_path)
@@ -396,7 +444,7 @@ def make_handler(log_path, snapshot_dir, active_timeout, state_file=None,
                                      "inline; filename=" + name)
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
-                    self.wfile.write(body)
+                    self._write_body(body)
                     return
                 self._json({"error": "no snapshot dir"}, 404)
                 return
@@ -408,7 +456,12 @@ def make_handler(log_path, snapshot_dir, active_timeout, state_file=None,
     return Handler
 
 
-def main(argv=None):
+def build_args(argv=None):
+    """Parse CLI args and apply the loopback/token safety gate.
+
+    Split from main() so the argparse layer (--token from the DASH_TOKEN env
+    var, the refuse-open-bind gate) is unit-testable without a server.
+    """
     p = argparse.ArgumentParser(description="intrusion sentry dashboard")
     p.add_argument("--log", default="events.jsonl")
     p.add_argument("--snapshot-dir", default=None)
@@ -431,13 +484,26 @@ def main(argv=None):
     args = p.parse_args(argv)
     if not args.allow_open and not args.token:
         try:
-            loopback = (ipaddress.ip_address(args.bind).version == 4
-                        and ipaddress.ip_address(args.bind).is_loopback)
+            # is_loopback covers IPv4 + IPv6 (::1) natively, but Python's
+            # IPv6 is_loopback IGNORES v4-mapped addresses: ::ffff:127.0.0.1
+            # reports False even though it points at loopback (a common bind
+            # for dual-stack listeners). Check the mapped v4 explicitly.
+            ip = ipaddress.ip_address(args.bind.split("%")[0].strip("[]"))
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+                loopback = ip.ipv4_mapped.is_loopback
+            else:
+                loopback = ip.is_loopback
         except ValueError:
             loopback = args.bind == "localhost"
         if not loopback:
             p.error("refusing to serve an open dashboard on a non-loopback "
-                    "bind; set --token, bind 127.0.0.1, or pass --allow-open")
+                    "bind; set --token, bind 127.0.0.1/::1, or pass "
+                    "--allow-open")
+    return args
+
+
+def main(argv=None):
+    args = build_args(argv)
     handler = make_handler(args.log, args.snapshot_dir, args.active_timeout,
                            args.state_file, token=args.token,
                            heartbeat_timeout=args.heartbeat_timeout)

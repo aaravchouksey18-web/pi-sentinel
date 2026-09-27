@@ -154,6 +154,18 @@ broker restart (or WiFi blip) can never silently kill remote control.
 > the sentry forever. Publish live commands with `retain` off (the default)
 > — or clear the retained message once you want to re-arm.
 
+> **Armed state survives restarts.** `state.json` records the last `armed`
+> value, and a restart (systemd `Restart=on-failure`, a stream-death exit,
+> a manual reboot) restores it instead of silently re-arming a sentry the
+> user had disarmed. `--start-disarmed` remains the explicit cold-boot
+> override: with it set, `armed` starts `false` regardless of the file.
+
+> **End-of-event captions are honest.** A genuine quiet end texts
+> "✅ All clear" — but when the alarm is stopped by a `disarm` or by a
+> lost camera stream, the caption says so ("Watch disarmed — scene NOT
+> confirmed clear" / "CAMERA LOST — this is NOT an all-clear") instead of
+> claiming the scene was confirmed clear.
+
 Every `--status-interval` seconds it publishes a **retained** heartbeat to
 `intrusion/status` and writes `state.json` (gitignored) so the dashboard
 shows the true sentry state — including a **DISARMED** pill — instead of
@@ -231,7 +243,10 @@ Telegram uses only the Python standard library.
   the watcher.
 - Snapshots older than `--snapshot-keep-days` (default 7) are pruned at
   startup so a long-running sentry can't fill the SD card; rotate the
-  event log with the shipped `deploy/logrotate-pi-intrusion` stanza.
+  event log with the shipped `deploy/logrotate-pi-intrusion` stanza. The
+  dashboard reads the whole rotation chain (`events.jsonl`, `.1`, `.2.gz`,
+  …) so the history table and "last event" card do **not** reset at each
+  midnight rotation — only the `limit` most recent events are parsed.
 - The detector publishes a **retained** heartbeat on `intrusion/status`
   (`online: true`) and flips it to `online: false` on graceful shutdown, so
   other MQTT consumers can watch for a dead sentry. The dashboard itself

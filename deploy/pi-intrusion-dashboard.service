@@ -17,13 +17,27 @@ EnvironmentFile=-/etc/pi-intrusion.env
 # DASH_TOKEN is optional; when set the dashboard requires it on every
 # request (?t=<token> or Authorization: Bearer <token>).
 # DASH_TOKEN is read from the env file by dashboard.py itself.
-ExecStart=/usr/bin/python3 %h/projects/pi-intrusion-detection/dashboard.py \
-    --log %h/projects/pi-intrusion-detection/events.jsonl \
-    --snapshot-dir %h/snapshots \
+# Paths are quoted so a checkout under a home directory with a space works.
+ExecStart=/usr/bin/python3 "%h/projects/pi-intrusion-detection/dashboard.py" \
+    --log "%h/projects/pi-intrusion-detection/events.jsonl" \
+    --snapshot-dir "%h/snapshots" \
     --bind 127.0.0.1 \
     --port 8001
 Restart=on-failure
 RestartSec=5
+# Hardening (pass-6): the dashboard is read-only by design (it serves files
+# and JSON, writes nothing), so give it a strict read-only view of the system.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=true
+UMask=0077
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

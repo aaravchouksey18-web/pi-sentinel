@@ -228,6 +228,24 @@ class Detector:
                      f"{self.inp.get('dtype')}); set_tensor requires an exact "
                      f"dtype match, and int8/uint8 quantized exports are not "
                      f"supported by this build — re-export float16/fp32")
+        oshape = list(self.out["shape"])
+        # The decoder assumes [1, anchors, 5+C] (anchors as ROWS). Modern
+        # exports (YOLOv8/v11) are [1, num_classes, 8400] (anchors as
+        # COLUMNS): on that layout this decoder would silently return ZERO
+        # detections at the default threshold (a guarded, calm sentry that
+        # detects nothing all night) or garbage boxes at lower thresholds.
+        # Gate the output shape the same way the input is gated.
+        if not (len(oshape) == 3 and oshape[0] == 1
+                and oshape[1] > 6 and 6 < oshape[2] < 64):
+            sys.exit(f"model output must be [1, anchors, 5+classes] (a "
+                     f"YOLOv5 single-output head); got {oshape} — re-export "
+                     f"with the v5-style head, this decoder cannot read "
+                     f"column-major (v8/v11) layouts")
+        if self.out.get("dtype") != np.float32:
+            sys.exit(f"model output dtype must be float32 (got "
+                     f"{self.out.get('dtype')}); an int8/uint8 output tensor "
+                     f"would be scaled as if it were 0-1 and silently report "
+                     f"garbage scores — re-export fp32")
         # keep input size tied to what the model actually declares
         self.input_size = int(shape[1])
         self.threshold = threshold
@@ -257,6 +275,21 @@ class Notifier:
         self.last_command = None
         self.want_status = False
         self._last_io_warn = 0.0
+
+        # A restart (systemd Restart=on-failure, or the 30-read stream-death
+        # exit) must never silently re-arm a sentry the user had DISARMED.
+        # state.json is written every heartbeat by this same process, so its
+        # "armed" is the most recent operator intent — reuse it unless
+        # --start-disarmed explicitly says cold boot. (Loop-5 removed the
+        # accidental retained-MQTT persistence path; this is the deliberate
+        # one.)
+        if (not getattr(args, "start_disarmed", False)
+                and getattr(args, "state_file", None)):
+            restored = self._restore_armed_state()
+            if restored is not None:
+                self.armed = restored
+                print(f"[control] restored armed={self.armed} from "
+                      f"{args.state_file} (restart, not cold boot)", flush=True)
 
         # JSONL event log
         if args.log:
@@ -331,6 +364,17 @@ class Notifier:
             print("telegram alerts enabled")
         elif self.telegram_token or self.telegram_chat:
             print("warning: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID must both be set")
+
+    def _restore_armed_state(self):
+        """Last persisted armed value from state.json; None if absent/corrupt."""
+        try:
+            with open(self.args.state_file, encoding="utf-8") as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(st, dict) or "armed" not in st:
+            return None
+        return bool(st["armed"])
 
     # -- event log -------------------------------------------------------- #
     def _warn_io(self, msg):
@@ -423,6 +467,21 @@ class Notifier:
             self.telegram_send_text("(photo failed) " + caption)
 
     def telegram_send_text(self, text):
+        """Send the text alert on a daemon thread.
+
+        The same stall hazard as the photo path: api.telegram.org can hang
+        for the full 20 s urlopen timeout, and fire_end() runs on the
+        detection thread — an inline send froze frame processing (10-40
+        frames unprocessed at typical ~1-2 s/frame, i.e. an intruder walking
+        through during the stall is never seen) and let state.json go stale,
+        which briefly showed OFFLINE on the dashboard at every event end.
+        """
+        if not (self.telegram_token and self.telegram_chat):
+            return
+        threading.Thread(target=self._telegram_send_text,
+                         args=(text,), daemon=True).start()
+
+    def _telegram_send_text(self, text):
         if not (self.telegram_token and self.telegram_chat):
             return
         query = urllib.parse.urlencode({"chat_id": self.telegram_chat,
@@ -511,8 +570,22 @@ class Notifier:
             payload["reason"] = reason
         self.log_line(payload)          # write the record before MQTT
         self.mqtt_publish(payload)
-        self.telegram_send_text(
-            f"✅ All clear — alarm lasted {ts - start_ts:.1f}s")
+        d = ts - start_ts
+        if reason == "disarmed":
+            # the user stepped in or a false alarm was silenced: the scene is
+            # NOT confirmed clear — saying "All clear" would send them back
+            # to bed while someone may still be on camera
+            caption = (f"⚠️ Watch disarmed — alarm silenced after {d:.1f}s, "
+                       "scene NOT confirmed clear")
+        elif reason == "stream_lost":
+            # camera went blind mid-event: there is no evidence the threat
+            # left, so this is emphatically not an all-clear (the only trace
+            # visible elsewhere is stream_ok:false in state.json)
+            caption = (f"⚠️ CAMERA LOST — sentry blind after {d:.1f}s; "
+                       "this is NOT an all-clear")
+        else:
+            caption = f"✅ All clear — alarm lasted {d:.1f}s"
+        self.telegram_send_text(caption)
 
 
 # --------------------------------------------------------------------------- #

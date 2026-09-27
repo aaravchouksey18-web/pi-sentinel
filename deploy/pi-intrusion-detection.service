@@ -13,17 +13,32 @@ User=pi
 WorkingDirectory=%h/projects/pi-intrusion-detection
 # Replace <CAMERA_URL> with your stream — e.g. http://<camera-ip>:81/stream
 # (example: http://192.0.2.50:81/stream) or a device index (/dev/video0).
-ExecStart=/usr/bin/python3 %h/projects/pi-intrusion-detection/intrusion.py \
+ExecStart=/usr/bin/python3 "%h/projects/pi-intrusion-detection/intrusion.py" \
     --stream <CAMERA_URL> \
     --headless \
     --mqtt-broker 127.0.0.1 \
     --mqtt-topic intrusion/events \
-    --snapshot-dir %h/snapshots
+    --snapshot-dir "%h/snapshots"
 # Telegram tokens etc. live here, outside the repo (see pi-intrusion.env.example);
 # the `-` prefix makes the file itself optional, not just its values.
 EnvironmentFile=-/etc/pi-intrusion.env
 Restart=on-failure
 RestartSec=5
+# Hardening (pass-6): the detector WRITES state.json + events.jsonl into the
+# checkout (WorkingDirectory) and snapshots into %h/snapshots, so both must
+# stay writable via ReadWritePaths under an otherwise read-only view.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/snapshots %h/projects/pi-intrusion-detection
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=true
+UMask=0077
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

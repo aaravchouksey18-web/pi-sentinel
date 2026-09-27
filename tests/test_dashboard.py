@@ -3,17 +3,20 @@
 or python3 tests/test_dashboard.py). Starts a real server on an ephemeral
 port and checks the security/token paths that used to be untested."""
 
+import gzip
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 from threading import Thread
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -163,6 +166,110 @@ class ReadStateTest(unittest.TestCase):
             with open(path, "w") as fh:
                 json.dump({"armed": True, "ts": 1.0}, fh)
             self.assertEqual(dashboard.read_state(path)["armed"], True)
+
+
+class BuildArgsTest(unittest.TestCase):
+    """The argparse layer: --token from DASH_TOKEN, loopback bind gate."""
+
+    def test_token_defaults_from_env(self):
+        with mock.patch.dict(os.environ, {"DASH_TOKEN": "envtok-1"}):
+            args = dashboard.build_args(["--bind", "127.0.0.1", "--port", "0"])
+        self.assertEqual(args.token, "envtok-1")
+
+    def test_explicit_token_overrides_env(self):
+        with mock.patch.dict(os.environ, {"DASH_TOKEN": "envtok-1"}):
+            args = dashboard.build_args(["--token", "cli-tok",
+                                         "--bind", "127.0.0.1", "--port", "0"])
+        self.assertEqual(args.token, "cli-tok")
+
+    def test_ipv6_loopback_bind_accepted_without_token(self):
+        # the loopback gate used to require version==4 and wrongly refused
+        # ::1, pushing IPv6-only setups into --allow-open. ::1 must pass.
+        args = dashboard.build_args(["--token", "", "--bind", "::1",
+                                     "--port", "0"])
+        self.assertEqual(args.bind, "::1")
+        args = dashboard.build_args(["--token", "", "--bind",
+                                     "::ffff:127.0.0.1", "--port", "0"])
+        self.assertEqual(args.bind, "::ffff:127.0.0.1")
+
+    def test_nonloopback_without_token_refused(self):
+        with self.assertRaises(SystemExit) as cm:
+            dashboard.build_args(["--token", "", "--bind", "0.0.0.0"])
+        self.assertEqual(cm.exception.code, 2)
+
+
+class LogChainTest(unittest.TestCase):
+    """read_events must span the logrotate chain, and derive_status must not
+    resurrect events orphaned by a restart."""
+
+    def _write_log(self, path, events):
+        with open(path, "wb") as fh:
+            for e in events:
+                fh.write((json.dumps(e) + "\n").encode())
+
+    def test_rotation_chain_merged_in_chronological_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "events.jsonl")
+            with gzip.open(base + ".2.gz", "wb") as fh:   # oldest, compressed
+                for e in [{"type": "end", "ts": 100.0},
+                          {"type": "end", "ts": 101.0}]:
+                    fh.write((json.dumps(e) + "\n").encode())
+            self._write_log(base + ".1", [{"type": "start", "ts": 200.0},
+                                          {"type": "end", "ts": 210.0}])
+            self._write_log(base, [{"type": "start", "ts": 300.0}])
+            events = dashboard.read_events(base, limit=10)
+            self.assertEqual([e["ts"] for e in events],
+                             [100.0, 101.0, 200.0, 210.0, 300.0])
+
+    def test_limit_cuts_across_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "events.jsonl")
+            self._write_log(base + ".1", [{"ts": i} for i in range(5)])
+            self._write_log(base, [{"ts": 10 + i} for i in range(10)])
+            # limit within the live file -> all from the live file
+            events = dashboard.read_events(base, limit=8)
+            self.assertEqual([e["ts"] for e in events],
+                             [12, 13, 14, 15, 16, 17, 18, 19])
+            # limit larger than the live file -> spills into the rotated
+            # chain (older file first, chronologically)
+            events = dashboard.read_events(base, limit=12)
+            self.assertEqual([e["ts"] for e in events],
+                             [3, 4, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
+
+    def test_rotation_gap_means_no_chain_files(self):
+        # no .1/.2 files exist -> plain single-file behavior, unchanged
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "events.jsonl")
+            self._write_log(base, [{"ts": 1.0}, {"ts": 2.0}])
+            events = dashboard.read_events(base, limit=10)
+            self.assertEqual([e["ts"] for e in events], [1.0, 2.0])
+
+    def test_boot_record_breaks_orphaned_start_scan(self):
+        # a crash mid-event usually leaves an open START behind; the boot
+        # record from the restart must stop the scan so that old event
+        # cannot pin the pill ACTIVE/STALE (the new process's state.json is
+        # the source of truth after a reboot)
+        now = time.time()
+        events = [{"type": "start", "ts": now - 3600},
+                  {"type": "boot", "ts": now}]
+        status, age = dashboard.derive_status(events, active_timeout=120.0)
+        self.assertEqual(status, "ARMED")
+        self.assertIsNone(age)
+
+    def test_boot_alone_is_armed(self):
+        now = time.time()
+        status, _ = dashboard.derive_status([{"type": "boot", "ts": now}],
+                                            active_timeout=120.0)
+        self.assertEqual(status, "ARMED")
+
+    def test_orphaned_start_without_boot_still_stale(self):
+        # the boot-break is for the restart case only; a plain open START
+        # with no reboot must still go STALE exactly as before
+        now = time.time()
+        status, age = dashboard.derive_status(
+            [{"type": "start", "ts": now - 300}], active_timeout=120.0)
+        self.assertEqual(status, "STALE")
+        self.assertGreater(age, 170.0)
 
 
 if __name__ == "__main__":

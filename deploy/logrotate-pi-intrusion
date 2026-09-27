@@ -15,7 +15,9 @@
     notifempty
     # rename rotation instead of copytruncate: the detector reopens the log
     # per line, so a rename cycle loses nothing, and the fresh file is
-    # owned by pi (create) so writes keep succeeding.
+    # owned by pi (create) so writes keep succeeding. The dashboard reads
+    # the whole chain (events.jsonl, .1, .2.gz, ...) so the UI keeps the
+    # full history across rotations — nothing else needs to change here.
     su pi pi
     create 0640 pi pi
 }
